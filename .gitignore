@@ -1,0 +1,12 @@
+/target/
+/build/
+/builddir/
+/.flatpak-builder/
+/flatpak/.flatpak-builder/
+/flatpak/.generator-venv/
+/flatpak/flatpak-cargo-generator.py
+/flatpak/repo/
+/flatpak/state/
+*.swp
+__pycache__/
+*.pyc

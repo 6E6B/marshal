@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Marshal
+Comment=Manage MCP servers
+Exec=marshal
+Icon=io.github.marshal.Marshal
+Terminal=false
+Categories=Development;GTK;
+Keywords=MCP;servers;tools;
+StartupNotify=true
+StartupWMClass=io.github.marshal.Marshal

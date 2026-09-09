@@ -1,0 +1,66 @@
+# SPDX-License-Identifier: MIT
+#
+# Local development manifest. Flathub submissions must replace the file
+# sources with a tagged upstream git commit and live in a separate repository.
+id: io.github.marshal.Marshal
+runtime: org.gnome.Platform
+runtime-version: '50'
+sdk: org.gnome.Sdk
+appstream-compose: true
+command: marshal
+sdk-extensions:
+  - org.freedesktop.Sdk.Extension.rust-stable
+finish-args:
+  # GTK 4 needs the Wayland/X11 sockets, IPC, and GPU access.
+  - --share=ipc
+  - --socket=fallback-x11
+  - --socket=wayland
+  - --device=dri
+  # HTTP MCP endpoints and OpenAI/ngrok tunnels.
+  - --share=network
+  # Read and write client MCP configs under the user's home directory.
+  - --filesystem=home
+  # API tokens for remote tunnels.
+  - --talk-name=org.freedesktop.secrets
+  # Launch MCP servers, ngrok, and agent CLIs that are installed on the host.
+  - --talk-name=org.freedesktop.Flatpak
+cleanup:
+  - '*.a'
+  - '*.la'
+  - /include
+  - /lib/pkgconfig
+  - /share/doc
+build-options:
+  append-path: /usr/lib/sdk/rust-stable/bin
+  env:
+    CARGO_HOME: /run/build/marshal/cargo
+    CARGO_NET_OFFLINE: 'true'
+modules:
+  - name: marshal
+    buildsystem: meson
+    config-opts:
+      - --buildtype=release
+    sources:
+      - type: dir
+        path: ../src
+        dest: src
+      - type: dir
+        path: ../data
+        dest: data
+      - type: dir
+        path: ../build-aux
+        dest: build-aux
+      - type: file
+        path: ../Cargo.toml
+      - type: file
+        path: ../Cargo.lock
+      - type: file
+        path: ../LICENSE
+      - type: file
+        path: ../meson.build
+      - cargo-sources.json
+      - type: shell
+        commands:
+          - mkdir -p .cargo
+          - cp -f cargo/config .cargo/config.toml
+          - cp -f cargo/config cargo/config.toml

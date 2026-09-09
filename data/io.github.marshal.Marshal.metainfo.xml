@@ -1,0 +1,61 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.github.marshal.Marshal</id>
+  <name>Marshal</name>
+  <summary>Manage MCP servers</summary>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>GPL-3.0-or-later</project_license>
+  <developer id="io.github.marshal">
+    <name>Marshal Contributors</name>
+  </developer>
+  <launchable type="desktop-id">io.github.marshal.Marshal.desktop</launchable>
+  <url type="homepage">https://github.com/6E6B/marshal</url>
+  <url type="bugtracker">https://github.com/6E6B/marshal/issues</url>
+  <url type="vcs-browser">https://github.com/6E6B/marshal</url>
+  <description>
+    <p>
+      Marshal is a GNOME application for controlling servers that use the
+      Model Context Protocol (MCP).
+    </p>
+    <p>With Marshal you can:</p>
+    <ul>
+      <li>Start and stop MCP servers</li>
+      <li>Inspect a server’s tools and logs</li>
+      <li>Install server configuration into client programs</li>
+      <li>Give remote access with OpenAI or ngrok</li>
+    </ul>
+    <p>
+      Stdio servers, tunnel clients, and agent CLIs run on the host. Install
+      those tools on your system before using them from Marshal.
+    </p>
+  </description>
+  <screenshots>
+    <screenshot type="default">
+      <caption>The Marshal window</caption>
+      <image>https://raw.githubusercontent.com/6E6B/marshal/HEAD/screenshot.png</image>
+    </screenshot>
+  </screenshots>
+  <provides>
+    <binary>marshal</binary>
+  </provides>
+  <recommends>
+    <control>keyboard</control>
+    <control>pointing</control>
+    <display_length compare="ge">768</display_length>
+  </recommends>
+  <supports>
+    <control>touch</control>
+    <display_length compare="ge">360</display_length>
+  </supports>
+  <content_rating type="oars-1.1"/>
+  <releases>
+    <release version="0.1.0" date="2026-09-08">
+      <description>
+        <p>Initial public packaging.</p>
+      </description>
+    </release>
+  </releases>
+  <categories>
+    <category>Development</category>
+  </categories>
+</component>
