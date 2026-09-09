@@ -1,6 +1,12 @@
+<div align="center">
+
+<img src="data/io.github._6E6B.marshal.svg" alt="Marshal" width="128" height="128">
+
 # Marshal
 
 Marshal is a program for the GNOME desktop. Marshal controls servers that use the Model Context Protocol (MCP).
+
+</div>
 
 ![The Marshal window](screenshot.png)
 
@@ -30,8 +36,8 @@ flatpak install --user flathub org.gnome.Platform//50 org.gnome.Sdk//50 \
   org.freedesktop.Sdk.Extension.rust-stable//25.08
 ./flatpak/update-cargo-sources.sh
 flatpak-builder --user --install --force-clean builddir \
-  flatpak/io.github.marshal.Marshal.yml
-flatpak run io.github.marshal.Marshal
+  flatpak/io.github._6E6B.marshal.yml
+flatpak run io.github._6E6B.marshal
 ```
 
 If a native Marshal process is already running, GTK will activate that window instead of opening a second copy. Quit the native build first when you want to test the Flatpak.

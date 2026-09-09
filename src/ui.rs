@@ -1925,7 +1925,7 @@ impl Ui {
     fn about(&self) {
         adw::AboutDialog::builder()
             .application_name("Marshal")
-            .application_icon("io.github.marshal.Marshal")
+            .application_icon("io.github._6E6B.marshal")
             .developer_name("Marshal Contributors")
             .version(env!("CARGO_PKG_VERSION"))
             .website("https://github.com/6E6B/marshal")
@@ -2497,7 +2497,7 @@ mod tests {
             crate::config::ServerRegistry::at(dir.path().join("servers.json")),
         );
         let app = adw::Application::builder()
-            .application_id("io.github.marshal.Marshal.UITest")
+            .application_id("io.github._6E6B.marshal.UITest")
             .flags(gio::ApplicationFlags::NON_UNIQUE)
             .build();
         app.register(None::<&gio::Cancellable>).unwrap();

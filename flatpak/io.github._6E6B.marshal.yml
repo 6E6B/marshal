@@ -2,7 +2,7 @@
 #
 # Local development manifest. Flathub submissions must replace the file
 # sources with a tagged upstream git commit and live in a separate repository.
-id: io.github.marshal.Marshal
+id: io.github._6E6B.marshal
 runtime: org.gnome.Platform
 runtime-version: '50'
 sdk: org.gnome.Sdk

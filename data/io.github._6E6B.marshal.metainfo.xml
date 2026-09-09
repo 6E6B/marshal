@@ -1,14 +1,14 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <component type="desktop-application">
-  <id>io.github.marshal.Marshal</id>
+  <id>io.github._6E6B.marshal</id>
   <name>Marshal</name>
   <summary>Manage MCP servers</summary>
   <metadata_license>CC0-1.0</metadata_license>
   <project_license>GPL-3.0-or-later</project_license>
-  <developer id="io.github.marshal">
+  <developer id="io.github._6E6B">
     <name>Marshal Contributors</name>
   </developer>
-  <launchable type="desktop-id">io.github.marshal.Marshal.desktop</launchable>
+  <launchable type="desktop-id">io.github._6E6B.marshal.desktop</launchable>
   <url type="homepage">https://github.com/6E6B/marshal</url>
   <url type="bugtracker">https://github.com/6E6B/marshal/issues</url>
   <url type="vcs-browser">https://github.com/6E6B/marshal</url>

@@ -46,7 +46,7 @@ impl SecretStore {
     }
     fn attributes<'a>(server: &'a str, name: &'a str) -> HashMap<&'a str, &'a str> {
         HashMap::from([
-            ("application", "io.github.marshal.Marshal"),
+            ("application", "io.github._6E6B.marshal"),
             ("server", server),
             ("name", name),
         ])

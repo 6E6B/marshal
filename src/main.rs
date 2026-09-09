@@ -13,7 +13,7 @@ fn main() -> gtk::glib::ExitCode {
     let runtime = std::sync::Arc::new(tokio::runtime::Runtime::new().expect("Tokio runtime"));
     let manager = backend::Manager::new(runtime);
     let app = adw::Application::builder()
-        .application_id("io.github.marshal.Marshal")
+        .application_id("io.github._6E6B.marshal")
         .build();
     let hold = std::rc::Rc::new(std::cell::RefCell::new(None));
     app.connect_activate(move |app| {

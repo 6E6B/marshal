@@ -12,7 +12,7 @@ dependency('libadwaita-1', version: '>= 1.7')
 
 install_data(
   'LICENSE',
-  install_dir: get_option('datadir') / 'licenses' / 'io.github.marshal.Marshal',
+  install_dir: get_option('datadir') / 'licenses' / 'io.github._6E6B.marshal',
 )
 
 subdir('data')
