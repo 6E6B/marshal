@@ -12,3 +12,9 @@ install_data(
   'io.github._6E6B.marshal.svg',
   install_dir: get_option('datadir') / 'icons' / 'hicolor' / 'scalable' / 'apps',
 )
+
+install_data(
+  'io.github._6E6B.marshal-symbolic.svg',
+  install_dir: get_option('datadir') / 'icons' / 'hicolor' / 'symbolic' / 'apps',
+)
+

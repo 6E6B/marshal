@@ -1,5 +1,5 @@
 use crate::{
-    config::{Connection, RemoteConfig, Server, ServerRegistry},
+    config::{AppSettings, Connection, RemoteConfig, Server, ServerRegistry, SettingsRegistry},
     host,
     secrets::SecretStore,
 };
@@ -74,6 +74,8 @@ where
 pub struct Manager {
     pub runtime: Arc<tokio::runtime::Runtime>,
     registry: ServerRegistry,
+    settings_registry: SettingsRegistry,
+    settings: Mutex<AppSettings>,
     definitions: Mutex<Vec<Server>>,
     snapshots: Mutex<HashMap<String, Snapshot>>,
     peers: Mutex<HashMap<String, Peer<RoleClient>>>,
@@ -86,17 +88,35 @@ pub struct Manager {
 }
 impl Manager {
     pub fn new(runtime: Arc<tokio::runtime::Runtime>) -> Arc<Self> {
-        Self::with_registry(runtime, ServerRegistry::new())
+        Self::with_registries(runtime, ServerRegistry::new(), SettingsRegistry::new())
     }
+    #[cfg(test)]
     pub(crate) fn with_registry(
         runtime: Arc<tokio::runtime::Runtime>,
         registry: ServerRegistry,
     ) -> Arc<Self> {
+        let temp = tempfile::NamedTempFile::new()
+            .unwrap()
+            .into_temp_path()
+            .to_path_buf();
+        Self::with_registries(runtime, registry, SettingsRegistry::at(temp))
+    }
+    pub(crate) fn with_registries(
+        runtime: Arc<tokio::runtime::Runtime>,
+        registry: ServerRegistry,
+        settings_registry: SettingsRegistry,
+    ) -> Arc<Self> {
         let loaded = registry.load();
         let error = loaded.as_ref().err().map(ToString::to_string);
+        let mut settings = settings_registry.load().unwrap_or_default();
+        if crate::config::is_autostart_enabled() {
+            settings.auto_start_login = true;
+        }
         Arc::new(Self {
             runtime,
             registry,
+            settings_registry,
+            settings: Mutex::new(settings),
             definitions: Mutex::new(loaded.unwrap_or_default()),
             snapshots: Mutex::new(HashMap::new()),
             peers: Mutex::new(HashMap::new()),
@@ -107,6 +127,15 @@ impl Manager {
             operations: tokio::sync::Mutex::new(()),
             load_error: error,
         })
+    }
+    pub fn settings(&self) -> AppSettings {
+        self.settings.lock().unwrap().clone()
+    }
+    pub fn save_settings(&self, settings: AppSettings) -> Result<()> {
+        let _ = crate::config::sync_autostart(&settings);
+        self.settings_registry.save(&settings)?;
+        *self.settings.lock().unwrap() = settings;
+        Ok(())
     }
     pub fn servers(&self) -> Vec<Server> {
         self.definitions.lock().unwrap().clone()
@@ -1069,6 +1098,8 @@ mod tests {
         let m = Arc::new(Manager {
             runtime,
             registry: ServerRegistry::at(dir.path().join("servers.json")),
+            settings_registry: SettingsRegistry::at(dir.path().join("settings.json")),
+            settings: Mutex::new(AppSettings::default()),
             definitions: Mutex::new(vec![]),
             snapshots: Mutex::new(HashMap::new()),
             peers: Mutex::new(HashMap::new()),

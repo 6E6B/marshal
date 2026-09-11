@@ -206,6 +206,164 @@ impl ServerRegistry {
     }
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AppSettings {
+    #[serde(default)]
+    pub auto_start_login: bool,
+    #[serde(default = "default_true")]
+    pub run_in_background_on_close: bool,
+    #[serde(default)]
+    pub run_in_background_on_startup: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+impl Default for AppSettings {
+    fn default() -> Self {
+        Self {
+            auto_start_login: false,
+            run_in_background_on_close: true,
+            run_in_background_on_startup: false,
+        }
+    }
+}
+
+impl AppSettings {
+    pub fn can_run_in_background(&self) -> bool {
+        self.run_in_background_on_close || self.run_in_background_on_startup
+    }
+}
+
+pub struct SettingsRegistry {
+    path: PathBuf,
+}
+
+impl SettingsRegistry {
+    #[cfg(test)]
+    pub fn at(path: PathBuf) -> Self {
+        Self { path }
+    }
+
+    pub fn new() -> Self {
+        let path = directories::ProjectDirs::from("io", "marshal", "Marshal")
+            .expect("Configuration directory")
+            .config_dir()
+            .join("settings.json");
+        Self { path }
+    }
+
+    pub fn load(&self) -> Result<AppSettings> {
+        match std::fs::read(&self.path) {
+            Ok(bytes) => serde_json::from_slice(&bytes)
+                .context("Cannot read application settings; the original file has been preserved"),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(AppSettings::default()),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    pub fn save(&self, settings: &AppSettings) -> Result<()> {
+        use std::io::Write;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        let dir = self.path.parent().expect("settings.json path has a parent");
+        std::fs::create_dir_all(dir)?;
+        let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+        let temp = self
+            .path
+            .with_extension(format!("{}.tmp", uuid::Uuid::new_v4()));
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&temp)?;
+        file.write_all(&serde_json::to_vec_pretty(settings)?)?;
+        file.sync_all()?;
+        std::fs::rename(&temp, &self.path)?;
+        let _ = std::fs::File::open(dir).and_then(|f| f.sync_all());
+        Ok(())
+    }
+}
+
+pub fn autostart_dir() -> Option<PathBuf> {
+    if crate::host::in_flatpak() {
+        if let Some(host_config) = crate::host::host_env("XDG_CONFIG_HOME") {
+            return Some(PathBuf::from(host_config).join("autostart"));
+        }
+        if let Some(host_home) = crate::host::host_env("HOME") {
+            return Some(PathBuf::from(host_home).join(".config").join("autostart"));
+        }
+        std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config").join("autostart"))
+    } else if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME").filter(|s| !s.is_empty()) {
+        Some(PathBuf::from(xdg).join("autostart"))
+    } else {
+        std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config").join("autostart"))
+    }
+}
+
+pub fn autostart_desktop_path() -> Option<PathBuf> {
+    autostart_dir().map(|dir| dir.join("io.github._6E6B.marshal.desktop"))
+}
+
+pub fn autostart_exec_command(run_in_background: bool) -> String {
+    let bg_flag = if run_in_background { " --background" } else { "" };
+    if crate::host::in_flatpak() {
+        format!("flatpak run io.github._6E6B.marshal{bg_flag}")
+    } else if crate::host::is_command_in_path("marshal") {
+        format!("marshal{bg_flag}")
+    } else if let Ok(exe) = std::env::current_exe() {
+        format!("{}{bg_flag}", exe.display())
+    } else {
+        format!("marshal{bg_flag}")
+    }
+}
+
+pub fn is_autostart_file_enabled(path: &PathBuf) -> bool {
+    if !path.is_file() {
+        return false;
+    }
+    if let Ok(content) = std::fs::read_to_string(path) {
+        if content.lines().any(|l| {
+            let t = l.trim();
+            t == "Hidden=true" || t == "X-GNOME-Autostart-enabled=false"
+        }) {
+            return false;
+        }
+        return true;
+    }
+    false
+}
+
+pub fn is_autostart_enabled() -> bool {
+    let Some(path) = autostart_desktop_path() else {
+        return false;
+    };
+    is_autostart_file_enabled(&path)
+}
+
+pub fn sync_autostart(settings: &AppSettings) -> Result<()> {
+    let Some(path) = autostart_desktop_path() else {
+        bail!("Could not determine autostart directory");
+    };
+    sync_autostart_to_path(&path, settings)
+}
+
+pub fn sync_autostart_to_path(path: &PathBuf, settings: &AppSettings) -> Result<()> {
+    if settings.auto_start_login {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let exec = autostart_exec_command(settings.run_in_background_on_startup);
+        let content = format!(
+            "[Desktop Entry]\nType=Application\nName=Marshal\nComment=Manage MCP servers\nExec={exec}\nIcon=io.github._6E6B.marshal\nTerminal=false\nCategories=Development;GTK;\nStartupNotify=false\nX-GNOME-Autostart-enabled=true\n"
+        );
+        std::fs::write(path, content)?;
+    } else if path.exists() {
+        let _ = std::fs::remove_file(path);
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -296,5 +454,61 @@ mod tests {
         std::fs::write(&registry.path, "broken").unwrap();
         assert!(registry.load().is_err());
         assert_eq!(std::fs::read_to_string(&registry.path).unwrap(), "broken");
+    }
+
+    #[test]
+    fn app_settings_defaults_and_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = SettingsRegistry::at(dir.path().join("settings.json"));
+        let default_settings = registry.load().unwrap();
+        assert_eq!(
+            default_settings,
+            AppSettings {
+                auto_start_login: false,
+                run_in_background_on_close: true,
+                run_in_background_on_startup: false,
+            }
+        );
+
+        let custom = AppSettings {
+            auto_start_login: true,
+            run_in_background_on_close: false,
+            run_in_background_on_startup: true,
+        };
+        registry.save(&custom).unwrap();
+        assert_eq!(registry.load().unwrap(), custom);
+
+        // Deserializing empty JSON should use default values (especially run_in_background_on_close: true)
+        let deserialized: AppSettings = serde_json::from_str("{}").unwrap();
+        assert_eq!(deserialized, AppSettings::default());
+    }
+
+    #[test]
+    fn autostart_sync_creation_and_removal() {
+        let dir = tempfile::tempdir().unwrap();
+        let autostart_file = dir.path().join("io.github._6E6B.marshal.desktop");
+
+        let mut settings = AppSettings {
+            auto_start_login: true,
+            run_in_background_on_close: true,
+            run_in_background_on_startup: true,
+        };
+        sync_autostart_to_path(&autostart_file, &settings).unwrap();
+        assert!(autostart_file.exists());
+        let content = std::fs::read_to_string(&autostart_file).unwrap();
+        assert!(content.contains("--background"));
+        assert!(is_autostart_file_enabled(&autostart_file));
+
+        // When run_in_background_on_startup is disabled
+        settings.run_in_background_on_startup = false;
+        sync_autostart_to_path(&autostart_file, &settings).unwrap();
+        let content2 = std::fs::read_to_string(&autostart_file).unwrap();
+        assert!(!content2.contains("--background"));
+
+        // When disabled, file is removed
+        settings.auto_start_login = false;
+        sync_autostart_to_path(&autostart_file, &settings).unwrap();
+        assert!(!autostart_file.exists());
+        assert!(!is_autostart_file_enabled(&autostart_file));
     }
 }

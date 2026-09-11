@@ -24,6 +24,9 @@ finish-args:
   - --talk-name=org.freedesktop.secrets
   # Launch MCP servers, ngrok, and agent CLIs that are installed on the host.
   - --talk-name=org.freedesktop.Flatpak
+  # StatusNotifierItem system tray
+  - --talk-name=org.kde.StatusNotifierWatcher
+  - --talk-name=org.freedesktop.StatusNotifierWatcher
 cleanup:
   - '*.a'
   - '*.la'

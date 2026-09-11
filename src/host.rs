@@ -287,10 +287,10 @@ fn load_session_env() -> Vec<(OsString, OsString)> {
         }
     }
     vars.extend(graphical_session_env());
-    if !vars.iter().any(|(key, _)| key == "XAUTHORITY") {
-        if let Some(value) = std::env::var_os("XAUTHORITY").filter(|value| !value.is_empty()) {
-            vars.push((OsString::from("XAUTHORITY"), value));
-        }
+    if !vars.iter().any(|(key, _)| key == "XAUTHORITY")
+        && let Some(value) = std::env::var_os("XAUTHORITY").filter(|value| !value.is_empty())
+    {
+        vars.push((OsString::from("XAUTHORITY"), value));
     }
     vars
 }
@@ -378,6 +378,21 @@ pub fn is_executable(path: &Path) -> bool {
         .arg(path)
         .status()
         .is_ok_and(|status| status.success())
+}
+
+pub fn host_env(key: &str) -> Option<OsString> {
+    if in_flatpak() {
+        host_environ()
+            .get(OsStr::new(key))
+            .cloned()
+            .or_else(|| std::env::var_os(key))
+    } else {
+        std::env::var_os(key)
+    }
+}
+
+pub fn is_command_in_path(cmd: &str) -> bool {
+    host_path().iter().any(|dir| dir.join(cmd).is_file())
 }
 
 #[cfg(test)]

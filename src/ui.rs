@@ -15,6 +15,18 @@ struct CommandRow {
     delete: gtk::Button,
 }
 
+thread_local! {
+    static ACTIVE_UI: RefCell<Option<std::rc::Weak<Ui>>> = const { RefCell::new(None) };
+}
+
+pub(crate) fn dispatch_tray_action(action: crate::tray::TrayAction) {
+    ACTIVE_UI.with(|cell| {
+        if let Some(ui) = cell.borrow().as_ref().and_then(|w| w.upgrade()) {
+            ui.handle_tray_action(action);
+        }
+    });
+}
+
 pub(crate) struct Ui {
     window: adw::ApplicationWindow,
     manager: Arc<Manager>,
@@ -35,9 +47,15 @@ pub(crate) struct Ui {
     commands: adw::PreferencesGroup,
     command_rows: RefCell<Vec<CommandRow>>,
     command_signature: RefCell<String>,
+    tray: RefCell<Option<crate::tray::TrayService>>,
+    tray_spawn_rx: RefCell<Option<tokio::sync::oneshot::Receiver<Result<crate::tray::TrayService, String>>>>,
 }
 
-pub fn build(app: &adw::Application, manager: Arc<Manager>) -> Rc<Ui> {
+pub fn build(
+    app: &adw::Application,
+    manager: Arc<Manager>,
+    present_window: bool,
+) -> Rc<Ui> {
     let window = adw::ApplicationWindow::builder()
         .application(app)
         .title("Marshal")
@@ -45,7 +63,7 @@ pub fn build(app: &adw::Application, manager: Arc<Manager>) -> Rc<Ui> {
         .default_height(740)
         .width_request(360)
         .height_request(400)
-        .hide_on_close(true)
+        .hide_on_close(false)
         .build();
     let overlay = adw::ToastOverlay::new();
     let split = adw::NavigationSplitView::builder()
@@ -75,6 +93,7 @@ pub fn build(app: &adw::Application, manager: Arc<Manager>) -> Rc<Ui> {
         Some("Agent Clients & Inventory…"),
         Some("app.agent-clients"),
     );
+    menu.append(Some("Preferences"), Some("app.preferences"));
     menu.append(Some("About Marshal"), Some("app.about"));
     menu.append(Some("Quit"), Some("app.quit"));
     header.pack_end(
@@ -228,6 +247,8 @@ pub fn build(app: &adw::Application, manager: Arc<Manager>) -> Rc<Ui> {
         commands,
         command_rows: RefCell::new(vec![]),
         command_signature: RefCell::new(String::new()),
+        tray: RefCell::new(None),
+        tray_spawn_rx: RefCell::new(None),
     });
     connect(&add_command, &ui, |ui| {
         if let Some(id) = ui.id() {
@@ -307,6 +328,7 @@ pub fn build(app: &adw::Application, manager: Arc<Manager>) -> Rc<Ui> {
             }
         }),
         ("remove", |u| u.remove()),
+        ("preferences", |u| u.preferences()),
         ("about", |u| u.about()),
         ("quit", |u| u.quit()),
     ] {
@@ -320,6 +342,7 @@ pub fn build(app: &adw::Application, manager: Arc<Manager>) -> Rc<Ui> {
         app.add_action(&action);
     }
     app.set_accels_for_action("app.add-server", &["<Control>n"]);
+    app.set_accels_for_action("app.preferences", &["<Control>comma"]);
     app.set_accels_for_action("app.quit", &["<Control>q"]);
     let close = gio::SimpleAction::new("close", None);
     let weak = ui.window.downgrade();
@@ -330,6 +353,22 @@ pub fn build(app: &adw::Application, manager: Arc<Manager>) -> Rc<Ui> {
     });
     ui.window.add_action(&close);
     app.set_accels_for_action("win.close", &["<Control>w"]);
+    let weak = Rc::downgrade(&ui);
+    ui.window.connect_close_request(move |w| {
+        let Some(ui) = weak.upgrade() else {
+            return glib::Propagation::Proceed;
+        };
+        if ui.manager.settings().run_in_background_on_close {
+            w.set_visible(false);
+            ui.sync_tray();
+            glib::Propagation::Stop
+        } else {
+            ui.quit();
+            glib::Propagation::Stop
+        }
+    });
+    ACTIVE_UI.with(|cell| *cell.borrow_mut() = Some(Rc::downgrade(&ui)));
+    ui.sync_tray();
     ui.refresh_list();
     ui.update();
     if let Some(error) = &ui.manager.load_error {
@@ -346,10 +385,13 @@ pub fn build(app: &adw::Application, manager: Arc<Manager>) -> Rc<Ui> {
     for server in ui.manager.servers().into_iter().filter(|s| s.auto_start) {
         ui.operation(move |m| async move { m.start(&server.id).await });
     }
-    ui.window.present();
+    if present_window {
+        ui.window.present();
+    }
     // Retain the controller with the application; hiding the window leaves supervision alive.
     let retained = ui.clone();
     app.connect_shutdown(move |_| {
+        retained.shutdown_tray();
         let _ = &retained;
     });
     ui
@@ -446,6 +488,12 @@ fn string<'a>(v: &'a Value, key: &str) -> &'a str {
 }
 
 impl Ui {
+    pub fn present(&self) {
+        self.window.set_visible(true);
+        self.window.present();
+        self.sync_tray();
+    }
+
     fn command_editor(self: &Rc<Self>, server_id: String, existing: Option<CustomCommand>) {
         let dialog = adw::PreferencesDialog::builder()
             .title(if existing.is_some() {
@@ -1881,6 +1929,117 @@ impl Ui {
         self.diagnostics.set_visible(!diagnostics.is_empty());
         self.diagnostics.set_use_markup(false);
         self.diagnostics.set_subtitle(&diagnostics.join("\n"));
+
+        if let Some(mut rx) = self.tray_spawn_rx.borrow_mut().take() {
+            match rx.try_recv() {
+                Ok(Ok(service)) => {
+                    *self.tray.borrow_mut() = Some(service);
+                }
+                Ok(Err(err)) => {
+                    eprintln!("{err}");
+                }
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {
+                    *self.tray_spawn_rx.borrow_mut() = Some(rx);
+                }
+                Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {}
+            }
+        }
+        if self.can_run_in_background() {
+            if let Some(tray) = self.tray.borrow().as_ref() {
+                tray.update(self.current_tray_state());
+            }
+        } else if self.tray.borrow().is_some() || self.tray_spawn_rx.borrow().is_some() {
+            self.sync_tray();
+        }
+    }
+    pub(crate) fn can_run_in_background(&self) -> bool {
+        self.manager.settings().can_run_in_background() || !self.window.is_visible()
+    }
+    pub(crate) fn handle_tray_action(self: &Rc<Self>, action: crate::tray::TrayAction) {
+        match action {
+            crate::tray::TrayAction::ToggleOrPresent => {
+                if self.window.is_visible() && self.window.is_active() {
+                    self.window.set_visible(false);
+                    self.sync_tray();
+                } else {
+                    self.present();
+                }
+            }
+            crate::tray::TrayAction::Present => {
+                self.present();
+            }
+            crate::tray::TrayAction::Hide => {
+                self.window.set_visible(false);
+                self.sync_tray();
+            }
+            crate::tray::TrayAction::Preferences => {
+                self.present();
+                self.preferences();
+            }
+            crate::tray::TrayAction::ToggleServer(id) => {
+                let is_active = self.manager.snapshot(&id).active();
+                let server_id = id.clone();
+                if is_active {
+                    self.operation(move |m| async move { m.stop(&server_id).await });
+                } else {
+                    self.operation(move |m| async move { m.start(&server_id).await });
+                }
+            }
+            crate::tray::TrayAction::Quit => {
+                self.quit_application();
+            }
+        }
+    }
+    pub(crate) fn quit_application(&self) {
+        self.shutdown_tray();
+        let task = self.manager.runtime.spawn({
+            let m = self.manager.clone();
+            async move { m.shutdown().await }
+        });
+        let app = self.window.application().unwrap();
+        glib::spawn_future_local(async move {
+            let _ = task.await;
+            app.quit();
+        });
+    }
+    pub(crate) fn shutdown_tray(&self) {
+        *self.tray_spawn_rx.borrow_mut() = None;
+        if let Some(tray) = self.tray.borrow_mut().take() {
+            tray.shutdown();
+        }
+    }
+    pub(crate) fn sync_tray(&self) {
+        let can_bg = self.can_run_in_background();
+        if can_bg {
+            if self.tray.borrow().is_none() && self.tray_spawn_rx.borrow().is_none() {
+                let state = self.current_tray_state();
+                let rx = crate::tray::spawn_tray(state, self.manager.runtime.clone());
+                *self.tray_spawn_rx.borrow_mut() = Some(rx);
+            } else if let Some(tray) = self.tray.borrow().as_ref() {
+                tray.update(self.current_tray_state());
+            }
+        } else {
+            self.shutdown_tray();
+        }
+    }
+    fn current_tray_state(&self) -> crate::tray::TrayState {
+        let servers = self
+            .manager
+            .servers()
+            .into_iter()
+            .map(|s| {
+                let active = self.manager.snapshot(&s.id).active();
+                crate::tray::ServerStatus {
+                    id: s.id,
+                    name: s.name,
+                    active,
+                }
+            })
+            .collect();
+        crate::tray::TrayState {
+            window_visible: self.window.is_visible(),
+            servers,
+        }
     }
     fn restart(self: &Rc<Self>) {
         if let Some(id) = self.id() {
@@ -1922,6 +2081,91 @@ impl Ui {
             .push(&adw::NavigationPage::new(&toolbar, title));
         toolbar
     }
+    fn preferences(self: &Rc<Self>) {
+        let dialog = adw::PreferencesDialog::builder()
+            .title("Preferences")
+            .content_width(520)
+            .build();
+        let page = adw::PreferencesPage::new();
+        let group = adw::PreferencesGroup::builder()
+            .title("Startup and Background")
+            .description("Configure autostart and background running behavior.")
+            .build();
+
+        let settings = self.manager.settings();
+
+        let auto_start = adw::SwitchRow::builder()
+            .title("Start on Login")
+            .subtitle("Automatically launch Marshal when logging into your desktop session")
+            .active(settings.auto_start_login)
+            .build();
+
+        let bg_close = adw::SwitchRow::builder()
+            .title("Run in Background on Close")
+            .subtitle("Keep servers and remote access active when the window is closed")
+            .active(settings.run_in_background_on_close)
+            .build();
+
+        let bg_startup = adw::SwitchRow::builder()
+            .title("Run in Background on Startup")
+            .subtitle("Start Marshal minimized in the background without opening a window")
+            .active(settings.run_in_background_on_startup)
+            .build();
+
+        {
+            let ui = self.clone();
+            let bg_startup = bg_startup.clone();
+            let dialog = dialog.clone();
+            auto_start.connect_active_notify(move |row| {
+                let mut current = ui.manager.settings();
+                current.auto_start_login = row.is_active();
+                current.run_in_background_on_startup = bg_startup.is_active();
+                if let Err(e) = ui.manager.save_settings(current) {
+                    dialog.add_toast(adw::Toast::new(&format!("Failed to update autostart: {e:#}")));
+                    row.set_active(ui.manager.settings().auto_start_login);
+                }
+            });
+        }
+
+        {
+            let ui = self.clone();
+            let dialog = dialog.clone();
+            bg_close.connect_active_notify(move |row| {
+                let mut current = ui.manager.settings();
+                current.run_in_background_on_close = row.is_active();
+                if let Err(e) = ui.manager.save_settings(current) {
+                    dialog.add_toast(adw::Toast::new(&format!("Failed to update setting: {e:#}")));
+                    row.set_active(ui.manager.settings().run_in_background_on_close);
+                } else {
+                    ui.sync_tray();
+                }
+            });
+        }
+
+        {
+            let ui = self.clone();
+            let auto_start = auto_start.clone();
+            let dialog = dialog.clone();
+            bg_startup.connect_active_notify(move |row| {
+                let mut current = ui.manager.settings();
+                current.run_in_background_on_startup = row.is_active();
+                current.auto_start_login = auto_start.is_active();
+                if let Err(e) = ui.manager.save_settings(current) {
+                    dialog.add_toast(adw::Toast::new(&format!("Failed to update startup setting: {e:#}")));
+                    row.set_active(ui.manager.settings().run_in_background_on_startup);
+                } else {
+                    ui.sync_tray();
+                }
+            });
+        }
+
+        group.add(&auto_start);
+        group.add(&bg_close);
+        group.add(&bg_startup);
+        page.add(&group);
+        dialog.add(&page);
+        dialog.present(Some(&self.window));
+    }
     fn about(&self) {
         adw::AboutDialog::builder()
             .application_name("Marshal")
@@ -1944,19 +2188,16 @@ impl Ui {
         let finish = {
             let ui = self.clone();
             move || {
-                let task = ui.manager.runtime.spawn({
-                    let m = ui.manager.clone();
-                    async move { m.shutdown().await }
-                });
-                let app = ui.window.application().unwrap();
-                glib::spawn_future_local(async move {
-                    let _ = task.await;
-                    app.quit();
-                });
+                ui.quit_application();
             }
         };
         if active {
-            let dialog = adw::AlertDialog::builder().heading("Stop Servers and Quit?").body("Closing the window keeps your servers running. Quitting stops managed servers and remote access.").build();
+            let body = if self.manager.settings().run_in_background_on_close {
+                "Closing the window keeps your servers running. Quitting stops managed servers and remote access."
+            } else {
+                "Quitting stops managed servers and remote access."
+            };
+            let dialog = adw::AlertDialog::builder().heading("Stop Servers and Quit?").body(body).build();
             dialog.add_responses(&[("cancel", "Cancel"), ("quit", "Stop and Quit")]);
             dialog.set_response_appearance("quit", adw::ResponseAppearance::Destructive);
             dialog.set_default_response(Some("cancel"));
@@ -2501,11 +2742,32 @@ mod tests {
             .flags(gio::ApplicationFlags::NON_UNIQUE)
             .build();
         app.register(None::<&gio::Cancellable>).unwrap();
-        let ui = build(&app, manager);
+        let ui = build(&app, manager, true);
         settle();
         assert!(!ui.split.is_collapsed());
         assert_eq!(ui.list_stack.visible_child_name().as_deref(), Some("empty"));
         snapshot(&ui, "empty-wide");
+        ui.preferences();
+        settle();
+        let pref_dialog = ui.window.visible_dialog().unwrap();
+        let pref_widgets = descendants(&pref_dialog);
+        assert!(pref_widgets.iter().any(|w| {
+            w.clone()
+                .downcast::<adw::SwitchRow>()
+                .is_ok_and(|r| r.title() == "Start on Login")
+        }));
+        assert!(pref_widgets.iter().any(|w| {
+            w.clone()
+                .downcast::<adw::SwitchRow>()
+                .is_ok_and(|r| r.title() == "Run in Background on Close")
+        }));
+        assert!(pref_widgets.iter().any(|w| {
+            w.clone()
+                .downcast::<adw::SwitchRow>()
+                .is_ok_and(|r| r.title() == "Run in Background on Startup")
+        }));
+        pref_dialog.close();
+        settle();
         ui.editor(None);
         settle();
         snapshot(&ui, "add-server");
