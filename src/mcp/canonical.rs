@@ -178,9 +178,23 @@ impl McpServer {
                     .collect();
                 out
             }
-            Connection::Http { url } => {
+            Connection::Http {
+                url,
+                headers,
+                secret_headers,
+            } => {
                 let mut out = Self::empty(&s.name, Transport::StreamableHttp);
                 out.url = Some(url.clone());
+                out.headers = headers
+                    .iter()
+                    .map(|(k, v)| (k.clone(), ConfigValue::Literal { value: v.clone() }))
+                    .collect();
+                // Placeholder: the keyring value is resolved before writing to a
+                // client; without it only inequality can be detected.
+                for name in secret_headers {
+                    out.headers
+                        .insert(name.clone(), ConfigValue::Env { name: name.clone() });
+                }
                 out
             }
         };
@@ -201,9 +215,35 @@ impl McpServer {
                 arguments: self.args.clone(),
                 directory: self.cwd.clone().unwrap_or_default(),
             },
-            Transport::StreamableHttp | Transport::Sse => Connection::Http {
-                url: self.url.clone().unwrap_or_default(),
-            },
+            Transport::StreamableHttp | Transport::Sse => {
+                let mut headers = BTreeMap::new();
+                for (k, v) in &self.headers {
+                    match v {
+                        ConfigValue::Literal { value } => {
+                            headers.insert(k.clone(), value.clone());
+                        }
+                        ConfigValue::Env { name } => {
+                            if let Ok(value) = std::env::var(name) {
+                                headers.insert(k.clone(), value);
+                            }
+                        }
+                        ConfigValue::EnvTemplate {
+                            name,
+                            prefix,
+                            suffix,
+                        } => {
+                            if let Ok(value) = std::env::var(name) {
+                                headers.insert(k.clone(), format!("{prefix}{value}{suffix}"));
+                            }
+                        }
+                    }
+                }
+                Connection::Http {
+                    url: self.url.clone().unwrap_or_default(),
+                    headers,
+                    secret_headers: vec![],
+                }
+            }
         };
         let mut environment = BTreeMap::new();
         let mut secrets = Vec::new();

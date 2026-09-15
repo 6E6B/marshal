@@ -7,7 +7,15 @@ use anyhow::{Context, Result, bail};
 use std::{sync::Arc, time::Duration};
 use tokio_util::sync::CancellationToken;
 
-pub trait TunnelProvider {
+/// What `probe` needs from the run loop.
+pub struct Probe<'a> {
+    pub manager: &'a Manager,
+    pub server: &'a Server,
+    /// Local bridge URL the tunnel forwards to.
+    pub endpoint: &'a str,
+}
+
+pub trait TunnelProvider: Send + Sync {
     fn command(
         &self,
         server: &Server,
@@ -15,10 +23,43 @@ pub trait TunnelProvider {
         token: &str,
         health: &str,
     ) -> Result<crate::host::Command>;
-    fn health_path(&self) -> &str;
+    /// Checks the tunnel; `Ok(None)` means still connecting, `Ok(Some)` the
+    /// public endpoint, `Err` that the probe itself could not be answered.
+    fn probe<'a>(
+        &'a self,
+        http: &'a reqwest::Client,
+        health: &'a str,
+        ctx: &'a Probe<'a>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Option<String>>> + Send + 'a>>;
 }
+
+async fn http_probe(
+    http: &reqwest::Client,
+    health: &str,
+    path: &str,
+) -> Result<Option<serde_json::Value>> {
+    let response = http
+        .get(format!("http://{health}{path}"))
+        .send()
+        .await
+        .context("probe request failed")?;
+    if !response.status().is_success() {
+        return Ok(None);
+    }
+    Ok(response.json::<serde_json::Value>().await.ok())
+}
+
+fn endpoint_path(endpoint: &str) -> String {
+    reqwest::Url::parse(endpoint)
+        .map(|u| u.path().to_owned())
+        .unwrap_or_default()
+}
+
 pub struct OpenAITunnelProvider;
 pub struct NgrokProvider;
+pub struct CloudflareProvider;
+pub struct TailscaleProvider;
+
 impl TunnelProvider for OpenAITunnelProvider {
     fn command(
         &self,
@@ -40,8 +81,17 @@ impl TunnelProvider for OpenAITunnelProvider {
             .env("LOG_LEVEL", "info");
         Ok(command)
     }
-    fn health_path(&self) -> &str {
-        "/readyz"
+    fn probe<'a>(
+        &'a self,
+        http: &'a reqwest::Client,
+        health: &'a str,
+        ctx: &'a Probe<'a>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Option<String>>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            let ready = http_probe(http, health, "/readyz").await?.is_some();
+            Ok(ready.then(|| ctx.server.remote.tunnel_id.clone()))
+        })
     }
 }
 impl TunnelProvider for NgrokProvider {
@@ -69,26 +119,159 @@ impl TunnelProvider for NgrokProvider {
         }
         Ok(command)
     }
-    fn health_path(&self) -> &str {
-        "/api/tunnels"
+    fn probe<'a>(
+        &'a self,
+        http: &'a reqwest::Client,
+        health: &'a str,
+        ctx: &'a Probe<'a>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Option<String>>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            let Some(data) = http_probe(http, health, "/api/tunnels").await? else {
+                return Ok(None);
+            };
+            Ok(data["tunnels"]
+                .as_array()
+                .and_then(|tunnels| {
+                    tunnels.iter().find_map(|t| {
+                        t["public_url"]
+                            .as_str()
+                            .filter(|url| url.starts_with("https://"))
+                            .map(str::to_owned)
+                    })
+                })
+                .map(|url| format!("{}{}", url.trim_end_matches('/'), endpoint_path(ctx.endpoint))))
+        })
+    }
+}
+
+impl TunnelProvider for CloudflareProvider {
+    fn command(
+        &self,
+        _server: &Server,
+        endpoint: &str,
+        _token: &str,
+        health: &str,
+    ) -> Result<crate::host::Command> {
+        let url = reqwest::Url::parse(endpoint)?;
+        let mut command = crate::host::tokio_command("cloudflared");
+        command
+            .arg("tunnel")
+            .arg("--url")
+            .arg(url.origin().ascii_serialization())
+            .arg("--metrics")
+            .arg(health)
+            .arg("--no-autoupdate");
+        Ok(command)
+    }
+    fn probe<'a>(
+        &'a self,
+        http: &'a reqwest::Client,
+        health: &'a str,
+        ctx: &'a Probe<'a>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Option<String>>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            let ready = http_probe(http, health, "/ready").await?.is_some();
+            if !ready {
+                return Ok(None);
+            }
+            // Quick tunnels have no API for the assigned URL; cloudflared
+            // prints it once the connection registers.
+            let logs = ctx.manager.snapshot(&ctx.server.id).logs;
+            let url = logs.iter().rev().find_map(|line| {
+                let start = line.find("https://")?;
+                let rest = &line[start..];
+                let end = rest
+                    .find(|c: char| c.is_whitespace() || c == '"')
+                    .unwrap_or(rest.len());
+                rest[..end].contains("trycloudflare.com").then(|| {
+                    format!("{}{}", rest[..end].trim_end_matches('/'), endpoint_path(ctx.endpoint))
+                })
+            });
+            Ok(url)
+        })
+    }
+}
+
+impl TunnelProvider for TailscaleProvider {
+    fn command(
+        &self,
+        _server: &Server,
+        endpoint: &str,
+        _token: &str,
+        health: &str,
+    ) -> Result<crate::host::Command> {
+        let url = reqwest::Url::parse(endpoint)?;
+        let port = url
+            .port()
+            .context("The bridge endpoint has no port to expose")?;
+        // tailscaled owns the listener; this process only keeps funnel applied.
+        let _ = health;
+        let mut command = crate::host::tokio_command("tailscale");
+        command.args([
+            "funnel",
+            "--yes",
+            "--https=443",
+            &format!("http://127.0.0.1:{port}"),
+        ]);
+        Ok(command)
+    }
+    fn probe<'a>(
+        &'a self,
+        _http: &'a reqwest::Client,
+        _health: &'a str,
+        ctx: &'a Probe<'a>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Option<String>>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            let output = crate::host::tokio_command("tailscale")
+                .args(["status", "--json"])
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::null())
+                .spawn()?
+                .wait_with_output()
+                .await?;
+            let data: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+            let dns = data["Self"]["DNSName"]
+                .as_str()
+                .map(|s| s.trim_end_matches('.'))
+                .filter(|s| !s.is_empty());
+            let online = data["Self"]["Online"].as_bool().unwrap_or(true);
+            Ok(if online {
+                dns.map(|name| format!("https://{name}{}", endpoint_path(ctx.endpoint)))
+            } else {
+                None
+            })
+        })
+    }
+}
+
+fn provider_for(name: &str) -> Result<Box<dyn TunnelProvider>> {
+    match name {
+        "openai" => Ok(Box::new(OpenAITunnelProvider)),
+        "ngrok" => Ok(Box::new(NgrokProvider)),
+        "cloudflare" => Ok(Box::new(CloudflareProvider)),
+        "tailscale" => Ok(Box::new(TailscaleProvider)),
+        _ => bail!("Choose a tunnel provider"),
     }
 }
 
 pub async fn run(manager: Arc<Manager>, server: &Server, cancel: CancellationToken) -> Result<()> {
-    let provider: Box<dyn TunnelProvider + Send + Sync> = match server.remote.provider.as_str() {
-        "openai" => Box::new(OpenAITunnelProvider),
-        "ngrok" => Box::new(NgrokProvider),
-        _ => bail!("Choose a tunnel provider"),
+    let provider = provider_for(&server.remote.provider)?;
+    let token = match RemoteConfig::credential_name(&server.remote.provider) {
+        Some(credential_name) => {
+            if SecretStore::contains(&server.id, credential_name).await? {
+                SecretStore::get(&server.id, credential_name).await
+            } else {
+                // Configurations created before provider-specific credentials used this key.
+                SecretStore::get(&server.id, "remote-token").await
+            }
+            .context("Save this provider’s credential in the keyring first")?
+        }
+        None => String::new(),
     };
-    let credential_name = crate::config::RemoteConfig::credential_name(&server.remote.provider)
-        .context("Choose a tunnel provider")?;
-    let token = if SecretStore::contains(&server.id, credential_name).await? {
-        SecretStore::get(&server.id, credential_name).await
-    } else {
-        // Configurations created before provider-specific credentials used this key.
-        SecretStore::get(&server.id, "remote-token").await
-    }
-    .context("Save this provider’s credential in the keyring first")?;
     let endpoint = manager.bridge(&server.id, cancel.clone()).await?;
     // Provider agents require a fixed health port. Reserve it until immediately before spawn.
     let health_socket = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
@@ -134,16 +317,17 @@ pub async fn run(manager: Arc<Manager>, server: &Server, cancel: CancellationTok
         });
     }
     drop(health_socket);
-    let mut child = command.spawn().context("Could not launch the tunnel client. Install tunnel-client or ngrok and make it available in PATH.")?;
+    let mut child = command.spawn().context("Could not launch the tunnel client. Install the provider’s command-line tool and make it available in PATH.")?;
     let pid = child.id().context("Tunnel process has no PID")?;
     let _group = ProcessGroup(pid);
+    let secrets: Vec<String> = std::iter::once(token).filter(|t| !t.is_empty()).collect();
     let stdout = tokio::spawn(pump(
         manager.clone(),
         server.id.clone(),
         "Tunnel",
         child.stdout.take().unwrap(),
         None,
-        vec![token.clone()],
+        secrets.clone(),
     ));
     let stderr = tokio::spawn(pump(
         manager.clone(),
@@ -151,7 +335,7 @@ pub async fn run(manager: Arc<Manager>, server: &Server, cancel: CancellationTok
         "Tunnel",
         child.stderr.take().unwrap(),
         None,
-        vec![token],
+        secrets,
     ));
     // Aborting these readers when the task is cancelled prevents detached readers keeping pipes open.
     struct Readers(tokio::task::JoinHandle<()>, tokio::task::JoinHandle<()>);
@@ -171,18 +355,18 @@ pub async fn run(manager: Arc<Manager>, server: &Server, cancel: CancellationTok
             status = child.wait() => bail!("Tunnel client exited: {}", status?),
             _ = cancel.cancelled() => return Ok(()),
             _ = timer.tick() => {
-                let response = client.get(format!("http://{address}{}", provider.health_path())).send().await;
-                match response {
-                    Ok(response) if response.status().is_success() => {
-                        let remote = if server.remote.provider == "openai" { Some(server.remote.tunnel_id.clone()) }
-                        else {
-                            let data: serde_json::Value = response.json().await?;
-                            data["tunnels"].as_array().and_then(|tunnels| tunnels.iter().find_map(|t| t["public_url"].as_str().filter(|url| url.starts_with("https://")).map(str::to_owned)))
-                                .map(|url| format!("{}{}", url.trim_end_matches('/'), reqwest::Url::parse(&endpoint).unwrap().path()))
-                        };
-                        manager.update(&server.id, |s| { s.remote_state = if remote.is_some() { "Connected" } else { "Connecting" }.into(); s.endpoint = remote; });
+                let ctx = Probe { manager: &manager, server, endpoint: &endpoint };
+                match provider.probe(&client, &address, &ctx).await {
+                    Ok(remote) => {
+                        manager.update(&server.id, |s| {
+                            s.remote_state = if remote.is_some() { "Connected" } else { "Connecting" }.into();
+                            s.endpoint = remote;
+                        });
                     }
-                    _ => manager.update(&server.id, |s| { s.remote_state = "Waiting for Tunnel".into(); s.endpoint = None; }),
+                    Err(_) => manager.update(&server.id, |s| {
+                        s.remote_state = "Waiting for Tunnel".into();
+                        s.endpoint = None;
+                    }),
                 }
             }
         }
@@ -229,5 +413,20 @@ mod tests {
         assert_eq!(args[1], "http://127.0.0.1:1234");
         assert!(!args.iter().any(|arg| *arg == "secret"));
         assert!(!args.iter().any(|arg| *arg == "--web-addr"));
+        let cloudflare = CloudflareProvider
+            .command(&server, endpoint, "", "127.0.0.1:1235")
+            .unwrap();
+        let args: Vec<_> = cloudflare.as_std().get_args().collect();
+        assert!(args.windows(2).any(|w| w == ["--url", "http://127.0.0.1:1234"]));
+        assert!(args.windows(2).any(|w| w == ["--metrics", "127.0.0.1:1235"]));
+        let tailscale = TailscaleProvider
+            .command(&server, endpoint, "", "127.0.0.1:1235")
+            .unwrap();
+        let args: Vec<_> = tailscale.as_std().get_args().collect();
+        assert_eq!(args[0], "funnel");
+        assert!(args.iter().any(|a| *a == "http://127.0.0.1:1234"));
+        assert!(provider_for("cloudflare").is_ok());
+        assert!(provider_for("tailscale").is_ok());
+        assert!(provider_for("nope").is_err());
     }
 }

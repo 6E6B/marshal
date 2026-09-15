@@ -32,6 +32,8 @@ pub enum TrayAction {
     Hide,
     Preferences,
     ToggleServer(String),
+    StartAll,
+    StopAll,
     Quit,
 }
 
@@ -169,6 +171,27 @@ impl ksni::Tray for MarshalTray {
                 SubMenu {
                     label: summary,
                     submenu: server_items,
+                    ..Default::default()
+                }
+                .into(),
+            );
+
+            items.push(
+                StandardItem {
+                    label: "Start All Servers".into(),
+                    activate: Box::new(move |_| {
+                        dispatch_action(TrayAction::StartAll);
+                    }),
+                    ..Default::default()
+                }
+                .into(),
+            );
+            items.push(
+                StandardItem {
+                    label: "Stop All Servers".into(),
+                    activate: Box::new(move |_| {
+                        dispatch_action(TrayAction::StopAll);
+                    }),
                     ..Default::default()
                 }
                 .into(),

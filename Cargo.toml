@@ -8,6 +8,7 @@ license = "GPL-3.0-or-later"
 [dependencies]
 adw = { package = "libadwaita", version = "0.8", features = ["v1_7"] }
 gtk = { package = "gtk4", version = "0.10", features = ["v4_16"] }
+gio = { version = "0.21", features = ["v2_80"] }
 tokio = { version = "1", features = ["full"] }
 tokio-util = "0.7"
 serde = { version = "1", features = ["derive"] }
@@ -27,6 +28,7 @@ toml_edit = { version = "0.25", features = ["serde"] }
 yaml-edit = "0.2"
 serde_yaml = "0.9"
 ksni = "0.3"
+gettext-rs = "0.8"
 
 [profile.dev]
 debug = 0

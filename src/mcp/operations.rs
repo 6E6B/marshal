@@ -36,6 +36,7 @@ pub enum TargetActionTaken {
 
 #[derive(Clone, Debug)]
 pub struct TargetOpResult {
+    #[cfg_attr(not(test), allow(dead_code))]
     pub target: Target,
     pub action: TargetActionTaken,
 }

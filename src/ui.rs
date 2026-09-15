@@ -1,11 +1,13 @@
 use crate::{
-    backend::Manager,
-    config::{Connection, CustomCommand, RemoteConfig, Server},
+    backend::{Manager, PendingElicitation},
+    config::{Connection, CustomCommand, Profile, RemoteConfig, Server},
+    i18n::t,
 };
 use adw::prelude::*;
+use anyhow::Context;
 use gtk::{gio, glib};
 use serde_json::{Value, json};
-use std::{cell::RefCell, rc::Rc, sync::Arc};
+use std::{cell::RefCell, collections::HashMap, rc::Rc, sync::Arc, time::Instant};
 
 struct CommandRow {
     id: String,
@@ -38,6 +40,8 @@ pub(crate) struct Ui {
     content_stack: gtk::Stack,
     selected: RefCell<Option<String>>,
     remote_states: RefCell<std::collections::HashMap<String, String>>,
+    states: RefCell<HashMap<String, String>>,
+    cpu_samples: RefCell<HashMap<String, (u64, Instant)>>,
     overview: adw::NavigationPage,
     status: adw::ActionRow,
     lifecycle: gtk::Button,
@@ -90,12 +94,24 @@ pub fn build(
     header.pack_start(&add);
     let menu = gio::Menu::new();
     menu.append(
-        Some("Agent Clients & Inventory…"),
+        Some(&t("Browse MCP Registry…")),
+        Some("app.registry-browser"),
+    );
+    menu.append(
+        Some(&t("Agent Clients & Inventory…")),
         Some("app.agent-clients"),
     );
-    menu.append(Some("Preferences"), Some("app.preferences"));
-    menu.append(Some("About Marshal"), Some("app.about"));
-    menu.append(Some("Quit"), Some("app.quit"));
+    let bulk = gio::Menu::new();
+    bulk.append(Some(&t("Start All Servers")), Some("app.start-all"));
+    bulk.append(Some(&t("Stop All Servers")), Some("app.stop-all"));
+    menu.append_section(None, &bulk);
+    let transfer = gio::Menu::new();
+    transfer.append(Some(&t("Export Servers…")), Some("app.export-servers"));
+    transfer.append(Some(&t("Import Servers…")), Some("app.import-servers"));
+    menu.append_section(None, &transfer);
+    menu.append(Some(&t("Preferences")), Some("app.preferences"));
+    menu.append(Some(&t("About Marshal")), Some("app.about"));
+    menu.append(Some(&t("Quit")), Some("app.quit"));
     header.pack_end(
         &gtk::MenuButton::builder()
             .icon_name("open-menu-symbolic")
@@ -104,10 +120,40 @@ pub fn build(
             .build(),
     );
     sidebar.add_top_bar(&header);
+    let search = gtk::SearchEntry::builder()
+        .placeholder_text("Filter servers")
+        .margin_start(9)
+        .margin_end(9)
+        .margin_top(6)
+        .margin_bottom(6)
+        .build();
+    sidebar.add_top_bar(&search);
     let list = gtk::ListBox::builder()
         .selection_mode(gtk::SelectionMode::Single)
         .build();
     list.add_css_class("navigation-sidebar");
+    {
+        let search = search.clone();
+        list.set_filter_func(move |row| {
+            let text = search.text();
+            if text.is_empty() {
+                return true;
+            }
+            let text = text.to_lowercase();
+            row.child()
+                .and_downcast::<adw::ActionRow>()
+                .is_some_and(|r| {
+                    r.title().to_lowercase().contains(&text)
+                        || r.subtitle()
+                            .map(|s| s.to_lowercase().contains(&text))
+                            .unwrap_or(false)
+                })
+        });
+    }
+    {
+        let list = list.clone();
+        search.connect_search_changed(move |_| list.invalidate_filter());
+    }
     {
         let manager = manager.clone();
         list.set_sort_func(move |a, b| {
@@ -143,12 +189,20 @@ pub fn build(
     let toolbar = adw::ToolbarView::new();
     let detail_header = adw::HeaderBar::new();
     let detail_menu = gio::Menu::new();
-    detail_menu.append(Some("Install to MCP Clients…"), Some("app.install-clients"));
-    detail_menu.append(Some("Configuration"), Some("app.configure"));
-    detail_menu.append(Some("Restart"), Some("app.restart"));
-    detail_menu.append(Some("Refresh Capabilities"), Some("app.refresh"));
+    let editing = gio::Menu::new();
+    editing.append(Some(&t("Configuration")), Some("app.configure"));
+    editing.append(
+        Some(&t("Manage MCP Clients…")),
+        Some("app.manage-clients"),
+    );
+    editing.append(Some(&t("Duplicate Server")), Some("app.duplicate"));
+    detail_menu.append_section(None, &editing);
+    let actions = gio::Menu::new();
+    actions.append(Some(&t("Restart")), Some("app.restart"));
+    actions.append(Some(&t("Refresh Capabilities")), Some("app.refresh"));
+    detail_menu.append_section(None, &actions);
     let removal = gio::Menu::new();
-    removal.append(Some("Remove Server…"), Some("app.remove"));
+    removal.append(Some(&t("Remove Server…")), Some("app.remove"));
     detail_menu.append_section(None, &removal);
     detail_header.pack_end(
         &gtk::MenuButton::builder()
@@ -185,11 +239,13 @@ pub fn build(
         .collect();
     let logs = link_row("Logs", "");
     inspect.add(&logs);
+    let traffic = link_row("Traffic", "");
+    inspect.add(&traffic);
     page.add(&inspect);
     let manage = adw::PreferencesGroup::builder().title("Manage").build();
-    let install_clients = link_row(
-        "Install to MCP Clients",
-        "Configure for Claude Code, VS Code, Codex…",
+    let manage_clients = link_row(
+        "Manage MCP Clients",
+        "Install or remove this server in Claude Code, VS Code, Codex…",
     );
     let remote = link_row("Remote Access", "");
     let configuration = link_row("Configuration", "");
@@ -197,7 +253,7 @@ pub fn build(
         .title("Connection")
         .subtitle_selectable(true)
         .build();
-    manage.add(&install_clients);
+    manage.add(&manage_clients);
     manage.add(&remote);
     manage.add(&configuration);
     manage.add(&diagnostics);
@@ -238,6 +294,8 @@ pub fn build(
         content_stack: content_stack.clone(),
         selected: RefCell::new(None),
         remote_states: RefCell::new(Default::default()),
+        states: RefCell::new(HashMap::new()),
+        cpu_samples: RefCell::new(HashMap::new()),
         overview,
         status,
         lifecycle,
@@ -265,6 +323,46 @@ pub fn build(
             ui.update();
         }
     });
+    {
+        let list = ui.list.clone();
+        let detail_menu = detail_menu.clone();
+        let show_list = list.clone();
+        let show_menu = move |x: f64, y: f64| {
+            let list = &show_list;
+            let Some(row) = list.row_at_y(y as i32) else {
+                return false;
+            };
+            list.select_row(Some(&row));
+            let menu = gtk::PopoverMenu::from_model(Some(&detail_menu));
+            menu.set_parent(list);
+            menu.set_pointing_to(Some(&gtk::gdk::Rectangle::new(
+                x as i32, y as i32, 1, 1,
+            )));
+            menu.connect_closed(|popover| popover.unparent());
+            menu.popup();
+            true
+        };
+        let gesture = gtk::GestureClick::builder()
+            .button(gtk::gdk::BUTTON_SECONDARY)
+            .build();
+        let show = show_menu.clone();
+        gesture.connect_pressed(move |gesture, _n, x, y| {
+            if show(x, y) {
+                gesture.set_state(gtk::EventSequenceState::Claimed);
+            }
+        });
+        list.add_controller(gesture);
+        let long_press = gtk::GestureLongPress::builder()
+            .touch_only(true)
+            .build();
+        let show = show_menu.clone();
+        long_press.connect_pressed(move |gesture, x, y| {
+            if show(x, y) {
+                gesture.set_state(gtk::EventSequenceState::Claimed);
+            }
+        });
+        list.add_controller(long_press);
+    }
     connect(&ui.lifecycle, &ui, |ui| {
         let Some(id) = ui.id() else {
             return;
@@ -299,6 +397,18 @@ pub fn build(
         }
     });
     let weak = Rc::downgrade(&ui);
+    traffic.connect_activated(move |_| {
+        if let Some(ui) = weak.upgrade() {
+            ui.traffic();
+        }
+    });
+    let weak = Rc::downgrade(&ui);
+    manage_clients.connect_activated(move |_| {
+        if let Some(ui) = weak.upgrade() {
+            ui.manage_clients();
+        }
+    });
+    let weak = Rc::downgrade(&ui);
     remote.connect_activated(move |_| {
         if let Some(ui) = weak.upgrade() {
             ui.remote();
@@ -310,18 +420,22 @@ pub fn build(
             ui.edit_selected();
         }
     });
-    let weak = Rc::downgrade(&ui);
-    install_clients.connect_activated(move |_| {
-        if let Some(ui) = weak.upgrade() {
-            ui.install_clients();
-        }
-    });
     for (name, handler) in [
         ("add-server", (|u: &Rc<Ui>| u.editor(None)) as fn(&Rc<Ui>)),
-        ("install-clients", |u| u.install_clients()),
+        ("registry-browser", |u| u.registry_browser()),
+        ("manage-clients", |u| u.manage_clients()),
         ("agent-clients", |u| u.agent_clients()),
         ("configure", |u| u.edit_selected()),
+        ("duplicate", |u| u.duplicate()),
         ("restart", |u| u.restart()),
+        ("start-all", |u| {
+            u.operation(|m| async move { m.start_all().await });
+        }),
+        ("stop-all", |u| {
+            u.operation(|m| async move { m.stop_all().await });
+        }),
+        ("export-servers", |u| u.export_servers()),
+        ("import-servers", |u| u.import_servers()),
         ("refresh", |u| {
             if let Some(id) = u.id() {
                 u.operation(move |m| async move { m.discover(&id).await });
@@ -487,6 +601,87 @@ fn string<'a>(v: &'a Value, key: &str) -> &'a str {
     v[key].as_str().unwrap_or("")
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StreamKind {
+    Logs,
+    Traffic,
+}
+
+fn provider_index(provider: &str) -> u32 {
+    match provider {
+        "openai" => 1,
+        "ngrok" => 2,
+        "cloudflare" => 3,
+        "tailscale" => 4,
+        _ => 0,
+    }
+}
+fn provider_id(index: u32) -> &'static str {
+    match index {
+        1 => "openai",
+        2 => "ngrok",
+        3 => "cloudflare",
+        4 => "tailscale",
+        _ => "",
+    }
+}
+
+/// Log lines are rendered as "HH:MM:SS  source  message".
+fn split_log_line(line: &str) -> Option<(&str, &str, &str)> {
+    let (stamp, rest) = line.split_once("  ")?;
+    let (source, message) = rest.split_once("  ")?;
+    Some((stamp, source, message))
+}
+
+/// Reads resident memory and computes CPU utilization between samples.
+fn process_stats(
+    samples: &mut HashMap<String, (u64, Instant)>,
+    id: &str,
+    pid: u32,
+) -> Option<(u64, f64)> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let close = stat.rfind(')')?;
+    let fields: Vec<&str> = stat[close + 2..].split_whitespace().collect();
+    // After "pid (comm)", index 0 is state (field 3), so utime (field 14)
+    // is index 11 and stime (field 15) is index 12.
+    let utime: u64 = fields.get(11)?.parse().ok()?;
+    let stime: u64 = fields.get(12)?.parse().ok()?;
+    let jiffies = utime + stime;
+    let hz = unsafe { libc::sysconf(libc::_SC_CLK_TCK) }.max(1) as u64;
+    let now = Instant::now();
+    let cpu = match samples.insert(id.to_owned(), (jiffies, now)) {
+        Some((prev, at)) => {
+            let ticks = jiffies.saturating_sub(prev) as f64;
+            let elapsed = now.duration_since(at).as_secs_f64();
+            if elapsed > 0.0 {
+                (ticks / hz as f64) / elapsed * 100.0
+            } else {
+                0.0
+            }
+        }
+        None => 0.0,
+    };
+    let rss = std::fs::read_to_string(format!("/proc/{pid}/status"))
+        .ok()
+        .and_then(|s| {
+            s.lines()
+                .find(|l| l.starts_with("VmRSS:"))
+                .and_then(|l| l.split_whitespace().nth(1)?.parse::<u64>().ok())
+        })
+        .unwrap_or(0);
+    Some((rss, cpu))
+}
+
+fn format_kib(kib: u64) -> String {
+    if kib >= 1024 * 1024 {
+        format!("{:.1} GiB", kib as f64 / 1024.0 / 1024.0)
+    } else if kib >= 1024 {
+        format!("{:.0} MiB", kib as f64 / 1024.0)
+    } else {
+        format!("{kib} KiB")
+    }
+}
+
 impl Ui {
     pub fn present(&self) {
         self.window.set_visible(true);
@@ -586,22 +781,34 @@ impl Ui {
 
     fn editor(self: &Rc<Self>, existing: Option<Server>) {
         let adding = existing.is_none();
-        let server = existing.unwrap_or_else(|| Server {
-            id: uuid::Uuid::new_v4().to_string(),
-            name: String::new(),
-            connection: Connection::Stdio {
-                executable: String::new(),
-                arguments: vec![],
-                directory: String::new(),
-            },
-            environment: Default::default(),
-            secrets: vec![],
-            auto_start: false,
-            restart_on_failure: false,
-            remote: RemoteConfig::default(),
-            commands: vec![],
-            bridge_port: None,
-        });
+        self.editor_impl(
+            existing.unwrap_or_else(|| Server {
+                id: uuid::Uuid::new_v4().to_string(),
+                name: String::new(),
+                connection: Connection::Stdio {
+                    executable: String::new(),
+                    arguments: vec![],
+                    directory: String::new(),
+                },
+                environment: Default::default(),
+                secrets: vec![],
+                auto_start: false,
+                restart_on_failure: false,
+                remote: RemoteConfig::default(),
+                commands: vec![],
+                bridge_port: None,
+            }),
+            adding,
+        );
+    }
+
+    /// Opens the editor for a new server with fields already filled in, e.g.
+    /// from the registry browser.
+    pub(crate) fn editor_prefilled(self: &Rc<Self>, server: Server) {
+        self.editor_impl(server, true);
+    }
+
+    fn editor_impl(self: &Rc<Self>, server: Server, adding: bool) {
         let draft = Rc::new(RefCell::new(server.clone()));
         let secret_changes = Rc::new(RefCell::new(Vec::<(String, String)>::new()));
         let dialog = adw::PreferencesDialog::builder()
@@ -735,25 +942,30 @@ impl Ui {
             .active(server.restart_on_failure)
             .build();
         let environment = link_row("Environment & Secrets", "");
+        let headers = link_row("Request Headers", "Stored for HTTP endpoints");
         advanced.add_row(&directory);
         advanced.add_row(&startup);
         advanced.add_row(&restart);
         advanced.add_row(&environment);
+        advanced.add_row(&headers);
         advanced_group.add(&advanced);
         page.add(&advanced_group);
         directory.set_visible(kind.selected() == 0);
         restart.set_visible(kind.selected() == 0);
         environment.set_visible(kind.selected() == 0);
+        headers.set_visible(kind.selected() == 1);
         let c = command.clone();
         let d = directory.clone();
         let r = restart.clone();
         let e = environment.clone();
+        let h = headers.clone();
         kind.connect_selected_notify(move |k| {
             let stdio = k.selected() == 0;
             c.set_title(if stdio { "Command" } else { "Endpoint URL" });
             d.set_visible(stdio);
             r.set_visible(stdio);
             e.set_visible(stdio);
+            h.set_visible(!stdio);
         });
         let env_draft = draft.clone();
         let env_changes = secret_changes.clone();
@@ -765,6 +977,30 @@ impl Ui {
                 env_draft.clone(),
                 env_changes.clone(),
                 manager.clone(),
+            )
+        });
+        let header_state = Rc::new(RefCell::new(
+            match &server.connection {
+                Connection::Http {
+                    headers,
+                    secret_headers,
+                    ..
+                } => (headers.clone(), secret_headers.clone()),
+                _ => Default::default(),
+            },
+        ));
+        let parent = dialog.clone();
+        let manager = self.manager.clone();
+        let header_changes = secret_changes.clone();
+        let header_draft = header_state.clone();
+        let header_server_id = server.id.clone();
+        headers.connect_activated(move |_| {
+            headers_editor(
+                &parent,
+                header_draft.clone(),
+                header_changes.clone(),
+                manager.clone(),
+                header_server_id.clone(),
             )
         });
         let action_group = adw::PreferencesGroup::new();
@@ -792,8 +1028,11 @@ impl Ui {
                     c
                 })
             } else {
+                let (headers, secret_headers) = header_state.borrow().clone();
                 Ok(Connection::Http {
                     url: command.text().trim().into(),
+                    headers,
+                    secret_headers,
                 })
             };
             match connection {
@@ -811,7 +1050,7 @@ impl Ui {
                         .unwrap_or_default()
                         .to_string_lossy()
                         .into(),
-                    Connection::Http { url } => reqwest::Url::parse(url)
+                    Connection::Http { url, .. } => reqwest::Url::parse(url)
                         .ok()
                         .and_then(|u| u.host_str().map(str::to_owned))
                         .unwrap_or_default(),
@@ -1141,6 +1380,12 @@ impl Ui {
         });
     }
     fn logs(&self) {
+        self.stream_page("Logs", StreamKind::Logs);
+    }
+    fn traffic(&self) {
+        self.stream_page("Traffic", StreamKind::Traffic);
+    }
+    fn stream_page(&self, title: &str, kind: StreamKind) {
         let Some(id) = self.id() else {
             return;
         };
@@ -1150,45 +1395,147 @@ impl Ui {
             .child(&view)
             .vexpand(true)
             .build();
-        let toolbar = self.push("Logs", &scroll);
+        let toolbar = self.push(title, &scroll);
+        let bar = gtk::ActionBar::new();
+        let search = gtk::SearchEntry::builder()
+            .placeholder_text("Filter")
+            .hexpand(true)
+            .build();
+        bar.pack_start(&search);
+        let sources = gtk::DropDown::from_strings(&["All Sources"]);
+        sources.set_tooltip_text(Some("Source"));
+        let source_list = Rc::new(RefCell::new(vec!["All Sources".to_string()]));
+        if kind == StreamKind::Logs {
+            bar.pack_start(&sources);
+        }
         let copy = gtk::Button::builder()
             .icon_name("edit-copy-symbolic")
-            .tooltip_text("Copy Logs")
+            .tooltip_text("Copy")
             .build();
-        let buffer = view.buffer();
-        copy.connect_clicked(move |button| {
-            button.clipboard().set_text(&buffer.text(
-                &buffer.start_iter(),
-                &buffer.end_iter(),
-                false,
-            ));
-        });
-        // A bottom toolbar supplies the log action without duplicating navigation headers.
-        let bar = gtk::ActionBar::new();
+        let save = gtk::Button::builder()
+            .icon_name("document-save-symbolic")
+            .tooltip_text("Save to File…")
+            .build();
+        bar.pack_end(&save);
         bar.pack_end(&copy);
         toolbar.add_bottom_bar(&bar);
+
+        let filtered = Rc::new(RefCell::new(String::new()));
+        {
+            let filtered = filtered.clone();
+            copy.connect_clicked(move |button| {
+                button.clipboard().set_text(&filtered.borrow());
+            });
+        }
+        {
+            let filtered = filtered.clone();
+            let overlay = self.overlay.clone();
+            let default_name = format!("marshal-{}.log", title.to_lowercase());
+            let title = title.to_owned();
+            let window = self.window.clone();
+            save.connect_clicked(move |_| {
+                let picker = gtk::FileDialog::builder()
+                    .title(format!("Save {title}"))
+                    .modal(true)
+                    .initial_name(&default_name)
+                    .build();
+                let filtered = filtered.clone();
+                let overlay = overlay.clone();
+                picker.save(Some(&window), None::<&gio::Cancellable>, move |result| {
+                    match result {
+                        Ok(file) => {
+                            let text = filtered.borrow().clone();
+                            match file.path() {
+                                Some(path) => match std::fs::write(&path, text) {
+                                    Ok(()) => overlay.add_toast(adw::Toast::new(&format!(
+                                        "Saved to {}",
+                                        path.display()
+                                    ))),
+                                    Err(e) => overlay.add_toast(adw::Toast::new(&format!(
+                                        "Could not save: {e}"
+                                    ))),
+                                },
+                                None => overlay
+                                    .add_toast(adw::Toast::new("Choose a local file")),
+                            }
+                        }
+                        Err(error)
+                            if error.matches(gtk::DialogError::Dismissed)
+                                || error.matches(gtk::DialogError::Cancelled) => {}
+                        Err(error) => overlay.add_toast(adw::Toast::new(&format!(
+                            "Could not save: {error}"
+                        ))),
+                    }
+                });
+            });
+        }
+        let rerender = Rc::new(std::cell::Cell::new(false));
+        {
+            let rerender = rerender.clone();
+            search.connect_search_changed(move |_| rerender.set(true));
+        }
+        {
+            let rerender = rerender.clone();
+            sources.connect_selected_notify(move |_| rerender.set(true));
+        }
         let manager = self.manager.clone();
         let weak = view.downgrade();
-        let scroll = scroll.downgrade();
+        let scroll_weak = scroll.downgrade();
         let mut previous = String::new();
         glib::timeout_add_local(std::time::Duration::from_millis(350), move || {
             let Some(view) = weak.upgrade() else {
                 return glib::ControlFlow::Break;
             };
-            let Some(scroll) = scroll.upgrade() else {
+            let Some(scroll) = scroll_weak.upgrade() else {
                 return glib::ControlFlow::Break;
             };
-            let text = manager
-                .snapshot(&id)
-                .logs
-                .into_iter()
+            let snapshot = manager.snapshot(&id);
+            let lines = match kind {
+                StreamKind::Logs => snapshot.logs,
+                StreamKind::Traffic => snapshot.traffic,
+            };
+            if kind == StreamKind::Logs {
+                let mut found: Vec<String> = vec!["All Sources".into()];
+                let mut seen: std::collections::HashSet<String> =
+                    ["All Sources".to_string()].into_iter().collect();
+                for line in &lines {
+                    if let Some((_, source, _)) = split_log_line(line)
+                        && seen.insert(source.to_string())
+                    {
+                        found.push(source.to_string());
+                    }
+                }
+                if *source_list.borrow() != found {
+                    *source_list.borrow_mut() = found.clone();
+                    sources.set_model(Some(&gtk::StringList::new(
+                        &found.iter().map(String::as_str).collect::<Vec<_>>(),
+                    )));
+                    sources.set_selected(0);
+                }
+            }
+            let needle = search.text().to_lowercase();
+            let selected_source = source_list
+                .borrow()
+                .get(sources.selected() as usize)
+                .cloned()
+                .unwrap_or_default();
+            let text = lines
+                .iter()
+                .filter(|line| {
+                    (kind != StreamKind::Logs
+                        || selected_source == "All Sources"
+                        || split_log_line(line).is_some_and(|(_, s, _)| s == selected_source))
+                        && (needle.is_empty() || line.to_lowercase().contains(&needle))
+                })
+                .cloned()
                 .collect::<Vec<_>>()
                 .join("\n");
-            if text != previous {
+            if text != previous || rerender.replace(false) {
                 let adjustment = scroll.vadjustment();
                 let at_bottom =
                     adjustment.value() >= adjustment.upper() - adjustment.page_size() - 12.0;
                 view.buffer().set_text(&text);
+                *filtered.borrow_mut() = text.clone();
                 if at_bottom {
                     let buffer = view.buffer();
                     let mark = buffer.create_mark(None, &buffer.end_iter(), false);
@@ -1199,6 +1546,88 @@ impl Ui {
             }
             glib::ControlFlow::Continue
         });
+    }
+    /// Shows a server-initiated request for user input.
+    fn elicitation_dialog(self: &Rc<Self>, pending: PendingElicitation) {
+        if !self.window.is_visible() {
+            self.present();
+        }
+        let server_name = self
+            .manager
+            .server(&pending.server_id)
+            .map(|s| s.name)
+            .unwrap_or_else(|_| "A server".into());
+        let dialog = adw::PreferencesDialog::builder()
+            .title(format!("{server_name} Requests Input"))
+            .content_width(520)
+            .build();
+        let page = adw::PreferencesPage::new();
+        let group = adw::PreferencesGroup::builder()
+            .description(&pending.message)
+            .build();
+        let fields = schema_fields(&pending.schema, &group);
+        page.add(&group);
+        let actions = adw::PreferencesGroup::new();
+        let buttons = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+        buttons.set_halign(gtk::Align::Center);
+        let decline = gtk::Button::with_label("Decline");
+        let accept = gtk::Button::builder()
+            .label("Submit")
+            .css_classes(["suggested-action"])
+            .build();
+        buttons.append(&decline);
+        buttons.append(&accept);
+        actions.add(&buttons);
+        page.add(&actions);
+        dialog.add(&page);
+
+        let respond = Rc::new(RefCell::new(Some(pending.respond)));
+        let answer = {
+            let respond = respond.clone();
+            Rc::new(
+                move |action: rmcp::model::ElicitationAction, content: Option<Value>| {
+                    if let Some(tx) = respond.borrow_mut().take() {
+                        let _ = tx.send(rmcp::model::CreateElicitationResult { action, content });
+                    }
+                },
+            ) as Rc<dyn Fn(rmcp::model::ElicitationAction, Option<Value>)>
+        };
+        {
+            let answer = answer.clone();
+            decline.connect_clicked(move |_| {
+                answer(rmcp::model::ElicitationAction::Decline, None);
+            });
+        }
+        let weak = dialog.downgrade();
+        {
+            let answer = answer.clone();
+            accept.connect_clicked(move |_| {
+                let Some(dialog) = weak.upgrade() else {
+                    return;
+                };
+                match collect_fields(&fields) {
+                    Ok(content) => {
+                        answer(rmcp::model::ElicitationAction::Accept, Some(content));
+                        dialog.close();
+                    }
+                    Err(e) => dialog.add_toast(adw::Toast::new(&e.to_string())),
+                }
+            });
+        }
+        dialog.connect_closed(move |_| {
+            // Closing without an answer declines rather than hanging the server.
+            answer(rmcp::model::ElicitationAction::Decline, None);
+        });
+        dialog.present(Some(&self.window));
+    }
+    fn notify(&self, title: &str, body: &str) {
+        let Some(app) = self.window.application() else {
+            return;
+        };
+        let notification = gio::Notification::new(title);
+        notification.set_body(Some(body));
+        notification.set_priority(gio::NotificationPriority::Normal);
+        app.send_notification(None, &notification);
     }
     fn remote(self: &Rc<Self>) {
         let Some(server) = self.id().and_then(|id| self.manager.server(&id).ok()) else {
@@ -1237,12 +1666,10 @@ impl Ui {
                 "Choose a provider…",
                 "OpenAI Secure MCP Tunnel",
                 "ngrok",
+                "Cloudflare Quick Tunnel",
+                "Tailscale Funnel",
             ]))
-            .selected(match server.remote.provider.as_str() {
-                "openai" => 1,
-                "ngrok" => 2,
-                _ => 0,
-            })
+            .selected(provider_index(&server.remote.provider))
             .build();
         let configure = gtk::Button::builder()
             .icon_name("emblem-system-symbolic")
@@ -1266,37 +1693,34 @@ impl Ui {
             if sync.get() {
                 return;
             }
-            let selected = match row.selected() {
-                1 => "openai",
-                2 => "ngrok",
-                _ => {
-                    let saved = ui
-                        .manager
-                        .server(&id)
-                        .map(|s| match s.remote.provider.as_str() {
-                            "openai" => 1,
-                            "ngrok" => 2,
-                            _ => 0,
-                        })
-                        .unwrap_or(0);
-                    sync.set(true);
-                    row.set_selected(saved);
-                    sync.set(false);
-                    return;
-                }
-            };
-            ui.tunnel_setup(&id, selected, row, sync.clone());
+            let selected = provider_id(row.selected());
+            if selected.is_empty() {
+                let saved = ui
+                    .manager
+                    .server(&id)
+                    .map(|s| provider_index(&s.remote.provider))
+                    .unwrap_or(0);
+                sync.set(true);
+                row.set_selected(saved);
+                sync.set(false);
+                return;
+            }
+            match selected {
+                "openai" | "ngrok" => ui.tunnel_setup(&id, selected, row, sync.clone()),
+                // Quick tunnels and tailscale funnel need no credentials; the
+                // CLIs must simply exist on PATH.
+                _ => ui.save_provider(&id, selected, row, sync.clone()),
+            }
         });
         let ui = self.clone();
         let id = server.id.clone();
         let row = provider.clone();
         configure.connect_clicked(move |_| {
-            let selected = match row.selected() {
-                1 => "openai",
-                2 => "ngrok",
-                _ => return,
-            };
-            ui.tunnel_setup(&id, selected, &row, syncing.clone());
+            let selected = provider_id(row.selected());
+            match selected {
+                "openai" | "ngrok" => ui.tunnel_setup(&id, selected, &row, syncing.clone()),
+                _ => ui.save_provider(&id, selected, &row, syncing.clone()),
+            }
         });
         let saving_start_option = Rc::new(std::cell::Cell::new(false));
         let saving = saving_start_option.clone();
@@ -1401,9 +1825,12 @@ impl Ui {
             } else {
                 "Enable Remote Access"
             });
-            let configured = m
-                .server(&id)
-                .is_ok_and(|server| matches!(server.remote.provider.as_str(), "openai" | "ngrok"));
+            let configured = m.server(&id).is_ok_and(|server| {
+                matches!(
+                    server.remote.provider.as_str(),
+                    "openai" | "ngrok" | "cloudflare" | "tailscale"
+                )
+            });
             toggle.set_sensitive(!busy.get() && (active || (s.state == "Running" && configured)));
             provider.set_sensitive(!busy.get() && !active);
             configure.set_sensitive(configured && !busy.get() && !active);
@@ -1496,11 +1923,7 @@ impl Ui {
             if let Some(row) = row.upgrade() {
                 let selected = manager
                     .server(&server_id)
-                    .map(|s| match s.remote.provider.as_str() {
-                        "openai" => 1,
-                        "ngrok" => 2,
-                        _ => 0,
-                    })
+                    .map(|s| provider_index(&s.remote.provider))
                     .unwrap_or(0);
                 syncing.set(true);
                 row.set_selected(selected);
@@ -1649,6 +2072,60 @@ impl Ui {
         });
         dialog.present(Some(&self.window));
     }
+    /// Saves a credential-free provider (cloudflared, tailscale) directly.
+    fn save_provider(
+        self: &Rc<Self>,
+        id: &str,
+        provider: &str,
+        row: &adw::ComboRow,
+        syncing: Rc<std::cell::Cell<bool>>,
+    ) {
+        let Ok(mut server) = self.manager.server(id) else {
+            return;
+        };
+        server.remote.provider = provider.to_owned();
+        let manager = self.manager.clone();
+        let task = manager.runtime.spawn({
+            let m = manager.clone();
+            async move { m.save(server, vec![]).await }
+        });
+        let ui = self.clone();
+        let weak = row.downgrade();
+        let provider = provider.to_owned();
+        let id = id.to_owned();
+        glib::spawn_future_local(async move {
+            let Some(row) = weak.upgrade() else {
+                return;
+            };
+            match task.await {
+                Ok(Ok(())) => {
+                    let binary = if provider == "cloudflare" {
+                        "cloudflared"
+                    } else {
+                        "tailscale"
+                    };
+                    ui.overlay.add_toast(adw::Toast::new(&format!(
+                        "Provider saved — {binary} must be installed on the host"
+                    )));
+                }
+                result => {
+                    syncing.set(true);
+                    row.set_selected(
+                        ui.manager
+                            .server(&id)
+                            .map(|s| provider_index(&s.remote.provider))
+                            .unwrap_or(0),
+                    );
+                    syncing.set(false);
+                    match result {
+                        Ok(Err(e)) => ui.error(&format!("{e:#}")),
+                        Err(e) => ui.error(&e.to_string()),
+                        _ => {}
+                    }
+                }
+            }
+        });
+    }
     fn id(&self) -> Option<String> {
         self.selected.borrow().clone()
     }
@@ -1709,6 +2186,11 @@ impl Ui {
         }
     }
     fn update(self: &Rc<Self>) {
+        while let Some(pending) = self.manager.take_elicitation() {
+            self.elicitation_dialog(pending);
+        }
+        let notify = self.manager.settings().notifications;
+        let hidden = !self.window.is_visible() || !self.window.is_active();
         for server in self.manager.servers() {
             let state = self.manager.snapshot(&server.id).remote_state;
             let previous = self
@@ -1717,28 +2199,73 @@ impl Ui {
                 .insert(server.id.clone(), state.clone());
             if previous.as_deref() != Some(&state) {
                 if let Some(error) = state.strip_prefix("Failed: ") {
-                    self.error(&format!(
-                        "Remote access for {} failed.\n\n{}",
-                        server.name, error
-                    ));
+                    if notify && hidden {
+                        self.notify(
+                            &format!("{}: remote access failed", server.name),
+                            error,
+                        );
+                    }
+                    if !hidden {
+                        self.error(&format!(
+                            "Remote access for {} failed.\n\n{}",
+                            server.name, error
+                        ));
+                    }
                 } else if state == "Connected"
                     || (state == "Local Only" && previous.as_deref().is_some_and(remote_active))
                 {
-                    self.overlay.add_toast(adw::Toast::new(&format!(
-                        "{}: {}",
-                        server.name,
-                        if state == "Connected" {
-                            "Remote access connected"
-                        } else {
-                            "Remote access stopped"
-                        }
-                    )));
+                    if notify && hidden {
+                        self.notify(
+                            &server.name,
+                            if state == "Connected" {
+                                "Remote access connected"
+                            } else {
+                                "Remote access stopped"
+                            },
+                        );
+                    } else {
+                        self.overlay.add_toast(adw::Toast::new(&format!(
+                            "{}: {}",
+                            server.name,
+                            if state == "Connected" {
+                                "Remote access connected"
+                            } else {
+                                "Remote access stopped"
+                            }
+                        )));
+                    }
                 }
+            }
+        }
+        for server in self.manager.servers() {
+            let state = self.manager.snapshot(&server.id).state;
+            let previous = self
+                .states
+                .borrow_mut()
+                .insert(server.id.clone(), state.clone());
+            if notify
+                && previous.as_deref() != Some(&state)
+                && state == "Failed"
+                && previous.as_deref().is_some_and(|p| p != "Failed" && p != "Stopped")
+            {
+                let error = self
+                    .manager
+                    .snapshot(&server.id)
+                    .error
+                    .unwrap_or_else(|| "The server stopped unexpectedly".into());
+                self.notify(&format!("{} stopped", server.name), &error);
             }
         }
 
         if let Some(app) = self.window.application() {
-            for name in ["configure", "restart", "refresh", "remove"] {
+            for name in [
+                "configure",
+                "restart",
+                "refresh",
+                "remove",
+                "duplicate",
+                "manage-clients",
+            ] {
                 if let Some(action) = app.lookup_action(name).and_downcast::<gio::SimpleAction>() {
                     action.set_enabled(self.id().is_some());
                 }
@@ -1867,7 +2394,7 @@ impl Ui {
         self.status.set_title(&s.state);
         self.status.set_subtitle(match &server.connection {
             Connection::Stdio { executable, .. } => executable,
-            Connection::Http { url } => url,
+            Connection::Http { url, .. } => url,
         });
         self.status.set_use_markup(false);
         self.lifecycle
@@ -1907,6 +2434,13 @@ impl Ui {
         let mut diagnostics = vec![];
         if let Some(pid) = s.pid {
             diagnostics.push(format!("PID {pid}"));
+            if let Some((rss, cpu)) =
+                process_stats(&mut self.cpu_samples.borrow_mut(), &id, pid)
+            {
+                diagnostics.push(format!("Memory {} · CPU {cpu:.1}%", format_kib(rss)));
+            }
+        } else {
+            self.cpu_samples.borrow_mut().remove(&id);
         }
         if let Some(since) = s.since {
             let elapsed = since.elapsed().as_secs();
@@ -1985,6 +2519,12 @@ impl Ui {
                     self.operation(move |m| async move { m.start(&server_id).await });
                 }
             }
+            crate::tray::TrayAction::StartAll => {
+                self.operation(|m| async move { m.start_all().await });
+            }
+            crate::tray::TrayAction::StopAll => {
+                self.operation(|m| async move { m.stop_all().await });
+            }
             crate::tray::TrayAction::Quit => {
                 self.quit_application();
             }
@@ -2051,9 +2591,9 @@ impl Ui {
             self.editor(Some(server));
         }
     }
-    fn install_clients(self: &Rc<Self>) {
+    fn manage_clients(self: &Rc<Self>) {
         if let Some(server) = self.id().and_then(|id| self.manager.server(&id).ok()) {
-            crate::mcp::ui::install_to_clients_dialog(
+            crate::mcp::ui::manage_clients_dialog(
                 &self.window,
                 &self.overlay,
                 self.manager.clone(),
@@ -2072,6 +2612,167 @@ impl Ui {
                 ui.update();
             },
         );
+    }
+    fn registry_browser(self: &Rc<Self>) {
+        let ui = self.clone();
+        crate::mcp::registry_browser::browse_dialog(
+            &self.window,
+            self.manager.runtime.clone(),
+            move |server| ui.editor_prefilled(server),
+        );
+    }
+    fn duplicate(self: &Rc<Self>) {
+        let Some(server) = self.id().and_then(|id| self.manager.server(&id).ok()) else {
+            return;
+        };
+        let mut copy = server.clone();
+        copy.id = uuid::Uuid::new_v4().to_string();
+        copy.name = format!("{} (Copy)", server.name);
+        copy.auto_start = false;
+        copy.bridge_port = None;
+        // Secret values stay under the original server id; the duplicate gets
+        // its own keyring entries when the user edits it.
+        let manager = self.manager.clone();
+        let overlay = self.overlay.clone();
+        let task = manager.runtime.spawn({
+            let m = manager.clone();
+            async move {
+                for key in &copy.secrets {
+                    if let Ok(value) = crate::secrets::SecretStore::get(&server.id, key).await {
+                        let _ = crate::secrets::SecretStore::set(&copy.id, key, &value).await;
+                    }
+                }
+                if let Connection::Http {
+                    secret_headers, ..
+                } = &server.connection
+                {
+                    for header in secret_headers {
+                        let name = RemoteConfig::header_secret_name(header);
+                        if let Ok(value) =
+                            crate::secrets::SecretStore::get(&server.id, &name).await
+                        {
+                            let _ =
+                                crate::secrets::SecretStore::set(&copy.id, &name, &value).await;
+                        }
+                    }
+                }
+                m.save(copy, vec![]).await
+            }
+        });
+        let ui = self.clone();
+        glib::spawn_future_local(async move {
+            match task.await {
+                Ok(Ok(())) => {
+                    ui.refresh_list();
+                    ui.update();
+                    overlay.add_toast(adw::Toast::new("Server duplicated"));
+                }
+                Ok(Err(e)) => ui.error(&format!("{e:#}")),
+                Err(e) => ui.error(&e.to_string()),
+            }
+        });
+    }
+    fn export_servers(self: &Rc<Self>) {
+        let servers = self.manager.servers();
+        let picker = gtk::FileDialog::builder()
+            .title("Export Servers")
+            .modal(true)
+            .initial_name("marshal-servers.json")
+            .build();
+        let overlay = self.overlay.clone();
+        picker.save(Some(&self.window), None::<&gio::Cancellable>, move |result| {
+            match result {
+                Ok(file) => match file.path() {
+                    Some(path) => {
+                        let outcome = serde_json::to_vec_pretty(&servers)
+                            .map_err(anyhow::Error::from)
+                            .and_then(|json| std::fs::write(&path, json).map_err(Into::into));
+                        match outcome {
+                            Ok(()) => overlay.add_toast(adw::Toast::new(&format!(
+                                "Exported {} server{} (keyring secrets are not exported)",
+                                servers.len(),
+                                if servers.len() == 1 { "" } else { "s" }
+                            ))),
+                            Err(e) => overlay
+                                .add_toast(adw::Toast::new(&format!("Export failed: {e:#}"))),
+                        }
+                    }
+                    None => overlay.add_toast(adw::Toast::new("Choose a local file")),
+                },
+                Err(error)
+                    if error.matches(gtk::DialogError::Dismissed)
+                        || error.matches(gtk::DialogError::Cancelled) => {}
+                Err(error) => overlay
+                    .add_toast(adw::Toast::new(&format!("Could not export: {error}"))),
+            }
+        });
+    }
+    fn import_servers(self: &Rc<Self>) {
+        let picker = gtk::FileDialog::builder()
+            .title("Import Servers")
+            .modal(true)
+            .build();
+        let filter = gtk::FileFilter::new();
+        filter.add_suffix("json");
+        filter.set_name(Some("JSON files"));
+        picker.set_filters(Some(&gio::ListStore::new::<gtk::FileFilter>()));
+        picker.set_default_filter(Some(&filter));
+        let ui = self.clone();
+        picker.open(Some(&self.window), None::<&gio::Cancellable>, move |result| {
+            let file = match result {
+                Ok(file) => file,
+                Err(error)
+                    if error.matches(gtk::DialogError::Dismissed)
+                        || error.matches(gtk::DialogError::Cancelled) =>
+                {
+                    return;
+                }
+                Err(error) => {
+                    ui.error(&format!("Could not open file: {error}"));
+                    return;
+                }
+            };
+            let Some(path) = file.path() else {
+                ui.error("Choose a local file");
+                return;
+            };
+            let manager = ui.manager.clone();
+            let m = manager.clone();
+            let task = manager.runtime.spawn(async move {
+                let raw = std::fs::read(&path)?;
+                let mut imported: Vec<Server> = serde_json::from_slice(&raw)
+                    .context("The file does not contain Marshal servers")?;
+                let mut definitions = m.servers();
+                let mut count = 0usize;
+                for mut server in imported.drain(..) {
+                    server.validate()?;
+                    if definitions.iter().any(|s| s.id == server.id) {
+                        server.id = uuid::Uuid::new_v4().to_string();
+                    }
+                    if definitions.iter().any(|s| s.name == server.name) {
+                        server.name = format!("{} (imported)", server.name);
+                    }
+                    m.save(server.clone(), vec![]).await?;
+                    definitions.push(server);
+                    count += 1;
+                }
+                Ok::<_, anyhow::Error>(count)
+            });
+            glib::spawn_future_local(async move {
+                match task.await {
+                    Ok(Ok(count)) => {
+                        ui.refresh_list();
+                        ui.update();
+                        ui.overlay.add_toast(adw::Toast::new(&format!(
+                            "Imported {count} server{}",
+                            if count == 1 { "" } else { "s" }
+                        )));
+                    }
+                    Ok(Err(e)) => ui.error(&format!("Import failed: {e:#}")),
+                    Err(e) => ui.error(&e.to_string()),
+                }
+            });
+        });
     }
     fn push(&self, title: &str, child: &impl IsA<gtk::Widget>) -> adw::ToolbarView {
         let toolbar = adw::ToolbarView::new();
@@ -2159,11 +2860,243 @@ impl Ui {
             });
         }
 
+        let notifications = adw::SwitchRow::builder()
+            .title("Desktop Notifications")
+            .subtitle("Notify about crashed servers and remote access changes")
+            .active(settings.notifications)
+            .build();
+        {
+            let ui = self.clone();
+            let dialog = dialog.clone();
+            notifications.connect_active_notify(move |row| {
+                let mut current = ui.manager.settings();
+                current.notifications = row.is_active();
+                if let Err(e) = ui.manager.save_settings(current) {
+                    dialog.add_toast(adw::Toast::new(&format!("Failed to update setting: {e:#}")));
+                    row.set_active(ui.manager.settings().notifications);
+                }
+            });
+        }
+
         group.add(&auto_start);
         group.add(&bg_close);
         group.add(&bg_startup);
+        group.add(&notifications);
         page.add(&group);
+
+        let profiles_group = adw::PreferencesGroup::builder()
+            .title("Profiles")
+            .description("Named sets of servers you can start together.")
+            .build();
+        let new_profile = gtk::Button::builder()
+            .icon_name("list-add-symbolic")
+            .tooltip_text("New Profile")
+            .valign(gtk::Align::Center)
+            .build();
+        profiles_group.set_header_suffix(Some(&new_profile));
+        page.add(&profiles_group);
+
+        let profile_rows: Rc<RefCell<Vec<adw::ActionRow>>> = Rc::new(RefCell::new(vec![]));
+        // Delete/edit handlers re-render the group through this shared cell.
+        let refresh_slot: Rc<RefCell<Option<Rc<dyn Fn()>>>> = Rc::new(RefCell::new(None));
+        *refresh_slot.borrow_mut() = Some({
+            let ui = self.clone();
+            let profiles_group = profiles_group.clone();
+            let profile_rows = profile_rows.clone();
+            let dialog = dialog.clone();
+            let refresh_slot = refresh_slot.clone();
+            Rc::new(move || {
+                for row in profile_rows.borrow_mut().drain(..) {
+                    profiles_group.remove(&row);
+                }
+                for profile in ui.manager.settings().profiles {
+                    let name = profile.name.clone();
+                    let row = adw::ActionRow::builder()
+                        .title(&profile.name)
+                        .subtitle(format!(
+                            "{} server{}",
+                            profile.servers.len(),
+                            if profile.servers.len() == 1 { "" } else { "s" }
+                        ))
+                        .build();
+                    let start = gtk::Button::builder()
+                        .icon_name("media-playback-start-symbolic")
+                        .tooltip_text(format!("Start profile {name}"))
+                        .valign(gtk::Align::Center)
+                        .build();
+                    {
+                        let ui = ui.clone();
+                        let name = name.clone();
+                        start.connect_clicked(move |_| {
+                            let name = name.clone();
+                            ui.operation(move |m| async move { m.start_profile(&name).await });
+                        });
+                    }
+                    let edit = gtk::Button::builder()
+                        .icon_name("document-edit-symbolic")
+                        .tooltip_text(format!("Edit profile {name}"))
+                        .valign(gtk::Align::Center)
+                        .build();
+                    {
+                        let ui = ui.clone();
+                        let profile = profile.clone();
+                        let refresh_slot = refresh_slot.clone();
+                        edit.connect_clicked(move |_| {
+                            let refresh_slot = refresh_slot.clone();
+                            ui.profile_editor(Some(profile.clone()), move || {
+                                if let Some(refresh) = refresh_slot.borrow().as_ref() {
+                                    refresh();
+                                }
+                            });
+                        });
+                    }
+                    let delete = gtk::Button::builder()
+                        .icon_name("user-trash-symbolic")
+                        .tooltip_text(format!("Delete profile {name}"))
+                        .valign(gtk::Align::Center)
+                        .build();
+                    {
+                        let ui = ui.clone();
+                        let dialog = dialog.clone();
+                        let name = name.clone();
+                        let refresh_slot = refresh_slot.clone();
+                        delete.connect_clicked(move |_| {
+                            let mut current = ui.manager.settings();
+                            current.profiles.retain(|p| p.name != name);
+                            if let Err(e) = ui.manager.save_settings(current) {
+                                dialog.add_toast(adw::Toast::new(&format!(
+                                    "Failed to delete profile: {e:#}"
+                                )));
+                            }
+                            if let Some(refresh) = refresh_slot.borrow().as_ref() {
+                                refresh();
+                            }
+                        });
+                    }
+                    row.add_suffix(&start);
+                    row.add_suffix(&edit);
+                    row.add_suffix(&delete);
+                    profiles_group.add(&row);
+                    profile_rows.borrow_mut().push(row);
+                }
+            })
+        });
+        {
+            let ui = self.clone();
+            let refresh_slot = refresh_slot.clone();
+            new_profile.connect_clicked(move |_| {
+                let refresh_slot = refresh_slot.clone();
+                ui.profile_editor(None, move || {
+                    if let Some(refresh) = refresh_slot.borrow().as_ref() {
+                        refresh();
+                    }
+                });
+            });
+        }
+        if let Some(refresh) = refresh_slot.borrow().as_ref() {
+            refresh();
+        }
+
         dialog.add(&page);
+        dialog.present(Some(&self.window));
+    }
+    /// Editor for a named server profile; `done` re-renders the caller's list.
+    fn profile_editor(
+        self: &Rc<Self>,
+        existing: Option<Profile>,
+        done: impl Fn() + 'static,
+    ) {
+        let editing_name = existing.as_ref().map(|p| p.name.clone());
+        let dialog = adw::PreferencesDialog::builder()
+            .title(if editing_name.is_some() {
+                "Edit Profile"
+            } else {
+                "New Profile"
+            })
+            .content_width(460)
+            .build();
+        let page = adw::PreferencesPage::new();
+        let name_group = adw::PreferencesGroup::new();
+        let name_row = adw::EntryRow::builder()
+            .title("Profile Name")
+            .text(existing.as_ref().map(|p| p.name.as_str()).unwrap_or(""))
+            .build();
+        name_group.add(&name_row);
+        page.add(&name_group);
+
+        let servers_group = adw::PreferencesGroup::builder()
+            .title("Servers")
+            .description("Servers started together by this profile")
+            .build();
+        let checks: Vec<(String, adw::SwitchRow)> = self
+            .manager
+            .servers()
+            .into_iter()
+            .map(|server| {
+                let row = adw::SwitchRow::builder()
+                    .title(&server.name)
+                    .active(
+                        existing
+                            .as_ref()
+                            .is_some_and(|p| p.servers.contains(&server.id)),
+                    )
+                    .build();
+                row.set_use_markup(false);
+                servers_group.add(&row);
+                (server.id, row)
+            })
+            .collect();
+        page.add(&servers_group);
+
+        let actions = adw::PreferencesGroup::new();
+        let save = gtk::Button::builder()
+            .label("Save Profile")
+            .halign(gtk::Align::Center)
+            .css_classes(["suggested-action", "pill"])
+            .build();
+        actions.add(&save);
+        page.add(&actions);
+        dialog.add(&page);
+
+        let ui = self.clone();
+        let weak = dialog.downgrade();
+        save.connect_clicked(move |_| {
+            let Some(dialog) = weak.upgrade() else {
+                return;
+            };
+            let name = name_row.text().trim().to_owned();
+            if name.is_empty() {
+                dialog.add_toast(adw::Toast::new("Enter a profile name"));
+                return;
+            }
+            let servers: Vec<String> = checks
+                .iter()
+                .filter(|(_, row)| row.is_active())
+                .map(|(id, _)| id.clone())
+                .collect();
+            if servers.is_empty() {
+                dialog.add_toast(adw::Toast::new("Select at least one server"));
+                return;
+            }
+            let mut settings = ui.manager.settings();
+            if let Some(old) = &editing_name {
+                settings.profiles.retain(|p| &p.name != old);
+            }
+            if settings.profiles.iter().any(|p| p.name == name) {
+                dialog.add_toast(adw::Toast::new("A profile with this name exists"));
+                return;
+            }
+            settings.profiles.push(Profile {
+                name: name.clone(),
+                servers,
+            });
+            if let Err(e) = ui.manager.save_settings(settings) {
+                dialog.add_toast(adw::Toast::new(&format!("Failed to save: {e:#}")));
+                return;
+            }
+            dialog.close();
+            done();
+        });
         dialog.present(Some(&self.window));
     }
     fn about(&self) {
@@ -2682,6 +3615,224 @@ fn environment_editor(
             let row_clone = row.clone();
             remove.connect_clicked(move |_| {
                 remove_draft.borrow_mut().environment.remove(&key);
+                group.remove(&row_clone);
+            });
+            ordinary.add(&row);
+        }
+        name.set_text("");
+        value.set_text("");
+        name.grab_focus();
+    });
+    dialog.add(&page);
+    dialog.present(Some(parent));
+}
+
+/// Editor for HTTP request headers. `state` holds (literal headers, secret
+/// header names); secret values are stored in the keyring as `header:{name}`.
+fn headers_editor(
+    parent: &adw::PreferencesDialog,
+    state: Rc<RefCell<(std::collections::BTreeMap<String, String>, Vec<String>)>>,
+    changes: Rc<RefCell<Vec<(String, String)>>>,
+    manager: Arc<Manager>,
+    server_id: String,
+) {
+    let dialog = adw::PreferencesDialog::builder()
+        .title("Request Headers")
+        .content_width(520)
+        .build();
+    let page = adw::PreferencesPage::new();
+    let ordinary = adw::PreferencesGroup::builder()
+        .title("Headers")
+        .build();
+    let secret = adw::PreferencesGroup::builder()
+        .title("Secret Headers")
+        .description("Values are stored in the system keyring.")
+        .build();
+    for (name, value) in state.borrow().0.clone() {
+        let row = adw::EntryRow::builder().title(&name).text(&value).build();
+        row.set_use_markup(false);
+        let s = state.clone();
+        let key = name.clone();
+        row.connect_changed(move |row| {
+            s.borrow_mut()
+                .0
+                .insert(key.clone(), row.text().into());
+        });
+        let remove = gtk::Button::builder()
+            .icon_name("edit-delete-symbolic")
+            .tooltip_text("Remove Header")
+            .valign(gtk::Align::Center)
+            .build();
+        row.add_suffix(&remove);
+        let s = state.clone();
+        let group = ordinary.clone();
+        let row_clone = row.clone();
+        remove.connect_clicked(move |_| {
+            s.borrow_mut().0.remove(&name);
+            group.remove(&row_clone);
+        });
+        ordinary.add(&row);
+    }
+    for name in state.borrow().1.clone() {
+        let row = adw::PasswordEntryRow::builder()
+            .title(&name)
+            .sensitive(false)
+            .build();
+        row.set_use_markup(false);
+        let c = changes.clone();
+        let key = crate::config::RemoteConfig::header_secret_name(&name);
+        let loading = Rc::new(std::cell::Cell::new(true));
+        let loading_changed = loading.clone();
+        let row_key = key.clone();
+        row.connect_changed(move |row| {
+            if loading_changed.get() {
+                return;
+            }
+            let mut c = c.borrow_mut();
+            c.retain(|(k, _)| k != &row_key);
+            c.push((row_key.clone(), row.text().into()));
+        });
+        let remove = gtk::Button::builder()
+            .icon_name("edit-delete-symbolic")
+            .tooltip_text("Remove Secret Header")
+            .valign(gtk::Align::Center)
+            .build();
+        row.add_suffix(&remove);
+        let s = state.clone();
+        let c = changes.clone();
+        let group = secret.clone();
+        let row_clone = row.clone();
+        let remove_name = name.clone();
+        let remove_key = key.clone();
+        remove.connect_clicked(move |_| {
+            s.borrow_mut().1.retain(|k| k != &remove_name);
+            c.borrow_mut().retain(|(k, _)| k != &remove_key);
+            group.remove(&row_clone);
+        });
+        secret.add(&row);
+        let task = manager.runtime.spawn({
+            let server_id = server_id.clone();
+            async move { crate::secrets::SecretStore::get(&server_id, &key).await }
+        });
+        let weak_dialog = dialog.downgrade();
+        let name = name.clone();
+        glib::spawn_future_local(async move {
+            let result = task.await;
+            row.set_sensitive(true);
+            match result {
+                Ok(Ok(value)) => row.set_text(&value),
+                Ok(Err(e)) => {
+                    if let Some(dialog) = weak_dialog.upgrade() {
+                        dialog.add_toast(adw::Toast::new(&format!(
+                            "Could not load {name} from the keyring: {e}"
+                        )));
+                    }
+                }
+                Err(e) => {
+                    if let Some(dialog) = weak_dialog.upgrade() {
+                        dialog.add_toast(adw::Toast::new(&format!(
+                            "Could not load {name} from the keyring: {e}"
+                        )));
+                    }
+                }
+            }
+            loading.set(false);
+        });
+    }
+    page.add(&ordinary);
+    page.add(&secret);
+    let add_group = adw::PreferencesGroup::builder()
+        .title("Add Header")
+        .build();
+    let name = adw::EntryRow::builder().title("Header Name").build();
+    let value = adw::PasswordEntryRow::builder().title("Value").build();
+    let sensitive = adw::SwitchRow::builder()
+        .title("Store in Keyring")
+        .active(true)
+        .build();
+    let add = gtk::Button::builder()
+        .label("Add Header")
+        .halign(gtk::Align::Center)
+        .build();
+    add_group.add(&name);
+    add_group.add(&value);
+    add_group.add(&sensitive);
+    add_group.add(&add);
+    page.add(&add_group);
+    let s = state.clone();
+    let c = changes.clone();
+    let dialog_clone = dialog.clone();
+    add.connect_clicked(move |_| {
+        let key = name.text().trim().to_owned();
+        let valid = !key.is_empty()
+            && key
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b));
+        if !valid {
+            dialog_clone.add_toast(adw::Toast::new("Enter a valid HTTP header name"));
+            name.grab_focus();
+            return;
+        }
+        if s.borrow().0.contains_key(&key) || s.borrow().1.contains(&key) {
+            dialog_clone.add_toast(adw::Toast::new("This header already exists"));
+            return;
+        }
+        let text = value.text().to_string();
+        if sensitive.is_active() {
+            s.borrow_mut().1.push(key.clone());
+            let secret_key = crate::config::RemoteConfig::header_secret_name(&key);
+            c.borrow_mut().push((secret_key.clone(), text.clone()));
+            let row = adw::PasswordEntryRow::builder()
+                .title(&key)
+                .text(&text)
+                .build();
+            row.set_use_markup(false);
+            let s = s.clone();
+            let changed = c.clone();
+            let row_key = secret_key.clone();
+            row.connect_changed(move |row| {
+                let mut c = changed.borrow_mut();
+                c.retain(|(name, _)| name != &row_key);
+                c.push((row_key.clone(), row.text().into()));
+            });
+            let remove = gtk::Button::builder()
+                .icon_name("edit-delete-symbolic")
+                .tooltip_text("Remove Secret Header")
+                .valign(gtk::Align::Center)
+                .build();
+            row.add_suffix(&remove);
+            let c = c.clone();
+            let group = secret.clone();
+            let row_clone = row.clone();
+            remove.connect_clicked(move |_| {
+                s.borrow_mut().1.retain(|name| name != &key);
+                c.borrow_mut().retain(|(name, _)| name != &secret_key);
+                group.remove(&row_clone);
+            });
+            secret.add(&row);
+        } else {
+            s.borrow_mut().0.insert(key.clone(), text.clone());
+            let row = adw::EntryRow::builder().title(&key).text(&text).build();
+            row.set_use_markup(false);
+            let row_state = s.clone();
+            let row_key = key.clone();
+            row.connect_changed(move |row| {
+                row_state
+                    .borrow_mut()
+                    .0
+                    .insert(row_key.clone(), row.text().into());
+            });
+            let remove = gtk::Button::builder()
+                .icon_name("edit-delete-symbolic")
+                .tooltip_text("Remove Header")
+                .valign(gtk::Align::Center)
+                .build();
+            row.add_suffix(&remove);
+            let s = s.clone();
+            let group = ordinary.clone();
+            let row_clone = row.clone();
+            remove.connect_clicked(move |_| {
+                s.borrow_mut().0.remove(&key);
                 group.remove(&row_clone);
             });
             ordinary.add(&row);

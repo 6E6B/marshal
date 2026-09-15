@@ -12,6 +12,11 @@ pub enum Connection {
     },
     Http {
         url: String,
+        #[serde(default)]
+        headers: BTreeMap<String, String>,
+        /// Header names whose values live in the keyring as "header:{name}".
+        #[serde(default)]
+        secret_headers: Vec<String>,
     },
 }
 
@@ -38,6 +43,11 @@ impl RemoteConfig {
             name,
             "remote-token" | "remote-token-openai" | "remote-token-ngrok"
         )
+    }
+
+    /// Keyring key under which the value of a secret HTTP header is stored.
+    pub fn header_secret_name(header: &str) -> String {
+        format!("header:{header}")
     }
 
     pub fn validate_openai_tunnel_id(id: &str) -> Result<()> {
@@ -112,7 +122,7 @@ impl Server {
                     shell_words::join(std::iter::once(executable).chain(arguments))
                 }
             }
-            Connection::Http { url } => url.clone(),
+            Connection::Http { url, .. } => url.clone(),
         }
     }
     pub fn validate(&self) -> Result<()> {
@@ -129,7 +139,11 @@ impl Server {
             }
         }
         match &self.connection {
-            Connection::Http { url } => {
+            Connection::Http {
+                url,
+                headers,
+                secret_headers,
+            } => {
                 let parsed =
                     reqwest::Url::parse(url).context("Enter a complete HTTP or HTTPS URL")?;
                 if !["http", "https"].contains(&parsed.scheme()) || parsed.host_str().is_none() {
@@ -137,6 +151,19 @@ impl Server {
                 }
                 if !parsed.username().is_empty() || parsed.password().is_some() {
                     bail!("Credentials cannot be stored in an endpoint URL");
+                }
+                for (key, value) in headers {
+                    validate_header_name(key)?;
+                    if value.contains(['\0', '\r', '\n']) {
+                        bail!("Invalid value for header {key}");
+                    }
+                }
+                let mut seen = std::collections::HashSet::new();
+                for key in secret_headers {
+                    validate_header_name(key)?;
+                    if headers.contains_key(key) || !seen.insert(key) {
+                        bail!("Duplicate header: {key}");
+                    }
                 }
             }
             Connection::Stdio {
@@ -153,12 +180,25 @@ impl Server {
             }
         }
         for key in self.environment.keys().chain(self.secrets.iter()) {
-            if key.is_empty() || key.contains(['=', '\0']) {
+            if key.is_empty() || key.contains(['=', '\0', ':']) {
                 bail!("Invalid environment variable name: {key}");
             }
         }
         Ok(())
     }
+}
+
+/// RFC 7230 token characters; header names are matched case-insensitively, so
+/// keep them in the form the user entered and only reject invalid bytes.
+fn validate_header_name(key: &str) -> Result<()> {
+    let valid = !key.is_empty()
+        && key.bytes().all(|b| {
+            b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b)
+        });
+    if !valid {
+        bail!("Invalid header name: {key}");
+    }
+    Ok(())
 }
 
 pub struct ServerRegistry {
@@ -206,6 +246,14 @@ impl ServerRegistry {
     }
 }
 
+/// A named set of servers that can be started together.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Profile {
+    pub name: String,
+    #[serde(default)]
+    pub servers: Vec<String>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AppSettings {
     #[serde(default)]
@@ -214,6 +262,11 @@ pub struct AppSettings {
     pub run_in_background_on_close: bool,
     #[serde(default)]
     pub run_in_background_on_startup: bool,
+    #[serde(default)]
+    pub profiles: Vec<Profile>,
+    /// Desktop notifications for crashes and remote access events.
+    #[serde(default = "default_true")]
+    pub notifications: bool,
 }
 
 fn default_true() -> bool {
@@ -226,6 +279,8 @@ impl Default for AppSettings {
             auto_start_login: false,
             run_in_background_on_close: true,
             run_in_background_on_startup: false,
+            profiles: vec![],
+            notifications: true,
         }
     }
 }
@@ -283,6 +338,13 @@ impl SettingsRegistry {
         let _ = std::fs::File::open(dir).and_then(|f| f.sync_all());
         Ok(())
     }
+}
+
+/// Directory where per-server logs persist across restarts.
+pub fn logs_dir() -> PathBuf {
+    directories::ProjectDirs::from("io", "marshal", "Marshal")
+        .map(|dirs| dirs.data_dir().join("logs"))
+        .unwrap_or_else(|| std::env::temp_dir().join("marshal-logs"))
 }
 
 pub fn autostart_dir() -> Option<PathBuf> {
@@ -461,19 +523,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let registry = SettingsRegistry::at(dir.path().join("settings.json"));
         let default_settings = registry.load().unwrap();
-        assert_eq!(
-            default_settings,
-            AppSettings {
-                auto_start_login: false,
-                run_in_background_on_close: true,
-                run_in_background_on_startup: false,
-            }
-        );
+        assert_eq!(default_settings, AppSettings::default());
 
         let custom = AppSettings {
             auto_start_login: true,
             run_in_background_on_close: false,
             run_in_background_on_startup: true,
+            ..Default::default()
         };
         registry.save(&custom).unwrap();
         assert_eq!(registry.load().unwrap(), custom);
@@ -490,8 +546,8 @@ mod tests {
 
         let mut settings = AppSettings {
             auto_start_login: true,
-            run_in_background_on_close: true,
             run_in_background_on_startup: true,
+            ..Default::default()
         };
         sync_autostart_to_path(&autostart_file, &settings).unwrap();
         assert!(autostart_file.exists());

@@ -1,5 +1,5 @@
 use super::{
-    canonical::McpServer,
+    canonical::{ConfigValue, McpServer},
     detection::Platform,
     harnesses::Target,
     operations::{ConflictResolution, TargetActionTaken, TargetStatus},
@@ -11,8 +11,8 @@ use anyhow::Context;
 use gtk::glib;
 use std::{cell::RefCell, rc::Rc, sync::Arc};
 
-/// Shows a dialog to install the specified server into detected agent client harnesses.
-pub fn install_to_clients_dialog(
+/// Shows a dialog to install or remove the specified server in detected agent client harnesses.
+pub fn manage_clients_dialog(
     parent: &adw::ApplicationWindow,
     overlay: &adw::ToastOverlay,
     manager: Arc<Manager>,
@@ -33,7 +33,16 @@ pub fn install_to_clients_dialog(
             .map(|port| format!("http://127.0.0.1:{port}/{}/mcp", server.id))
     });
 
-    let canonical_direct = McpServer::from_managed(server);
+    let mut canonical_direct = McpServer::from_managed(server);
+    // Direct installs need real header values: clients connect upstream
+    // themselves, so keyring-backed secrets are resolved to literals here.
+    if let Ok(resolved) = manager.resolved_headers(server) {
+        for (key, value) in resolved {
+            canonical_direct
+                .headers
+                .insert(key, ConfigValue::Literal { value });
+        }
+    }
     let canonical_bridge = local_bridge_url
         .as_ref()
         .map(|url| McpServer::from_managed_bridge(server, url));
@@ -50,7 +59,7 @@ pub fn install_to_clients_dialog(
         .collect();
 
     let dialog = adw::PreferencesDialog::builder()
-        .title("Install to MCP Clients")
+        .title("Manage MCP Clients")
         .content_width(620)
         .content_height(540)
         .build();
@@ -84,7 +93,7 @@ pub fn install_to_clients_dialog(
     let clients_group = adw::PreferencesGroup::builder()
         .title("Detected MCP Clients")
         .description(format!(
-            "Choose which client configurations to update with '{}'. Existing identical configurations will be kept intact.",
+            "Checked clients will be configured with '{}'; unchecked clients will have it removed.",
             server.name
         ))
         .build();
@@ -94,6 +103,7 @@ pub fn install_to_clients_dialog(
         check: gtk::CheckButton,
         row: adw::ActionRow,
         base_subtitle: String,
+        status: RefCell<TargetStatus>,
     }
 
     let items: Rc<RefCell<Vec<TargetItem>>> = Rc::new(RefCell::new(Vec::new()));
@@ -124,6 +134,7 @@ pub fn install_to_clients_dialog(
 
             let check = gtk::CheckButton::new();
             check.set_valign(gtk::Align::Center);
+            check.set_active(!matches!(status, TargetStatus::NotInstalled));
 
             let title = if has_multiple_targets {
                 format!("{} ({})", adapter.display_name(), target.scope.label())
@@ -147,17 +158,13 @@ pub fn install_to_clients_dialog(
 
             match &status {
                 TargetStatus::Identical => {
-                    check.set_active(false);
                     row.add_css_class("dim-label");
                 }
                 TargetStatus::Conflict { .. } => {
                     has_conflicts = true;
-                    check.set_active(false);
                     row.add_css_class("warning");
                 }
-                TargetStatus::NotInstalled => {
-                    check.set_active(false);
-                }
+                TargetStatus::NotInstalled => {}
             }
 
             row.set_subtitle(&subtitle);
@@ -169,38 +176,87 @@ pub fn install_to_clients_dialog(
                 check,
                 row,
                 base_subtitle,
+                status: RefCell::new(status),
             });
         }
     }
 
-    // Install button
-    let install_btn = gtk::Button::builder()
-        .label("Install to MCP Clients")
+    if items.borrow().is_empty() {
+        clients_group.add(
+            &adw::ActionRow::builder()
+                .title("No MCP Clients Detected")
+                .subtitle("Install a client like Claude Code, VS Code, or Codex first")
+                .build(),
+        );
+    }
+
+    page.add(&clients_group);
+
+    // Conflict resolution options
+    let resolution_row = adw::ComboRow::builder()
+        .title("When conflict is found")
+        .model(&gtk::StringList::new(&[
+            "Replace existing configuration",
+            "Skip conflicting clients",
+            "Add as renamed server (-copy)",
+        ]))
+        .selected(1)
+        .build();
+
+    if has_conflicts {
+        let resolution_group = adw::PreferencesGroup::builder()
+            .title("Conflict Options")
+            .description(
+                "How to handle clients that already configure this server name differently:",
+            )
+            .build();
+        resolution_group.add(&resolution_row);
+        page.add(&resolution_group);
+    }
+
+    // Apply button
+    let apply_btn = gtk::Button::builder()
+        .label("Apply Changes")
         .halign(gtk::Align::Center)
         .valign(gtk::Align::Center)
         .css_classes(["suggested-action", "pill"])
         .sensitive(false)
         .build();
 
-    let update_install_sensitivity = {
+    let update_apply_sensitivity = {
         let items = items.clone();
-        let install_btn = install_btn.clone();
+        let apply_btn = apply_btn.clone();
+        let resolution_row = resolution_row.clone();
         move || {
-            let any_checked = items.borrow().iter().any(|item| item.check.is_active());
-            install_btn.set_sensitive(any_checked);
+            let skip_conflicts = resolution_row.selected() == 1;
+            let dirty = items.borrow().iter().any(|item| {
+                let status = item.status.borrow();
+                let installed = !matches!(*status, TargetStatus::NotInstalled);
+                if item.check.is_active() != installed {
+                    return true;
+                }
+                item.check.is_active()
+                    && matches!(*status, TargetStatus::Conflict { .. })
+                    && !skip_conflicts
+            });
+            apply_btn.set_sensitive(dirty);
         }
     };
 
     for item in items.borrow().iter() {
-        let update = update_install_sensitivity.clone();
+        let update = update_apply_sensitivity.clone();
         item.check.connect_toggled(move |_| update());
+    }
+    {
+        let update = update_apply_sensitivity.clone();
+        resolution_row.connect_selected_notify(move |_| update());
     }
 
     let update_statuses = {
         let items = items.clone();
         let canonical_bridge = canonical_bridge.clone();
         let canonical_direct = canonical_direct.clone();
-        let update_sensitivity = update_install_sensitivity.clone();
+        let update_sensitivity = update_apply_sensitivity.clone();
         move |selected_mode: u32| {
             let active_canonical = match (selected_mode, canonical_bridge.as_ref()) {
                 (0, Some(bridge)) => bridge,
@@ -213,64 +269,56 @@ pub fn install_to_clients_dialog(
                     .unwrap_or(TargetStatus::NotInstalled);
                 item.row
                     .set_subtitle(&target_status_subtitle(&item.base_subtitle, &status));
-                if matches!(status, TargetStatus::Identical) {
-                    item.check.set_active(false);
+                item.row.remove_css_class("warning");
+                item.row.remove_css_class("dim-label");
+                match &status {
+                    TargetStatus::Identical => item.row.add_css_class("dim-label"),
+                    TargetStatus::Conflict { .. } => item.row.add_css_class("warning"),
+                    TargetStatus::NotInstalled => {}
                 }
+                *item.status.borrow_mut() = status;
             }
             update_sensitivity();
         }
     };
     mode_row.connect_selected_notify(move |row| update_statuses(row.selected()));
 
-    page.add(&clients_group);
-
-    // Conflict resolution options
-    let resolution_group = adw::PreferencesGroup::builder()
-        .title("Conflict Options")
-        .description("How to handle clients that already configure this server name differently:")
-        .build();
-
-    let resolution_row = adw::ComboRow::builder()
-        .title("When conflict is found")
-        .model(&gtk::StringList::new(&[
-            "Replace existing configuration",
-            "Skip conflicting clients",
-            "Add as renamed server (-copy)",
-        ]))
-        .selected(if has_conflicts { 0 } else { 1 })
-        .build();
-
-    resolution_group.add(&resolution_row);
-    if has_conflicts {
-        page.add(&resolution_group);
-    }
-
     let dialog_weak = dialog.downgrade();
     let overlay_clone = overlay.clone();
     let server_clone = server.clone();
 
-    install_btn.connect_clicked(move |btn| {
+    apply_btn.connect_clicked(move |btn| {
         let Some(dialog) = dialog_weak.upgrade() else {
             return;
         };
 
-        let selected_targets: Vec<_> = items
-            .borrow()
-            .iter()
-            .filter(|item| item.check.is_active())
-            .map(|item| item.target.clone())
-            .collect();
-
-        if selected_targets.is_empty() {
-            dialog.add_toast(adw::Toast::new("Select at least one client"));
-            return;
-        }
-
+        let skip_conflicts = resolution_row.selected() == 1;
         let resolution = match resolution_row.selected() {
             1 => ConflictResolution::Skip,
             2 => ConflictResolution::Rename(format!("{}-copy", server_clone.name)),
             _ => ConflictResolution::Overwrite,
         };
+
+        let mut install_targets = Vec::new();
+        let mut remove_targets = Vec::new();
+        for item in items.borrow().iter() {
+            let status = item.status.borrow().clone();
+            let installed = !matches!(status, TargetStatus::NotInstalled);
+            if item.check.is_active() {
+                if !installed
+                    || (matches!(status, TargetStatus::Conflict { .. }) && !skip_conflicts)
+                {
+                    install_targets.push(item.target.clone());
+                }
+            } else if installed {
+                remove_targets.push(item.target.clone());
+            }
+        }
+
+        if install_targets.is_empty() && remove_targets.is_empty() {
+            dialog.add_toast(adw::Toast::new("No changes to apply"));
+            return;
+        }
 
         btn.set_sensitive(false);
         dialog.set_can_close(false);
@@ -285,62 +333,74 @@ pub fn install_to_clients_dialog(
         let dialog_to_close = dialog.clone();
 
         let task = manager.runtime.spawn(async move {
-            let canonical_to_write = if mode_selected == 0 {
-                let bridge_url = match manager_clone.ensure_local_bridge(&server_id_task).await {
-                    Ok(url) => url,
-                    Err(_) => local_bridge_url_task
-                        .context("Local bridge could not be started for this server")?,
-                };
-                McpServer::from_managed_bridge(&server_clone_task, &bridge_url)
+            let install_reports = if install_targets.is_empty() {
+                Vec::new()
             } else {
-                canonical_direct_task
+                let canonical_to_write = if mode_selected == 0 {
+                    let bridge_url =
+                        match manager_clone.ensure_local_bridge(&server_id_task).await {
+                            Ok(url) => url,
+                            Err(_) => local_bridge_url_task
+                                .context("Local bridge could not be started for this server")?,
+                        };
+                    McpServer::from_managed_bridge(&server_clone_task, &bridge_url)
+                } else {
+                    canonical_direct_task
+                };
+                HarnessRegistry::new().install_server(
+                    &canonical_to_write,
+                    &install_targets,
+                    resolution,
+                )?
             };
-            let registry = HarnessRegistry::new();
-            registry.install_server(&canonical_to_write, &selected_targets, resolution)
+            let remove_reports = if remove_targets.is_empty() {
+                Vec::new()
+            } else {
+                HarnessRegistry::new().remove_server(&server_clone_task.name, &remove_targets)?
+            };
+            Ok::<_, anyhow::Error>((install_reports, remove_reports))
         });
 
         glib::spawn_future_local(async move {
             let result = task.await;
             dialog_to_close.set_can_close(true);
             match result {
-                Ok(Ok(reports)) => {
+                Ok(Ok((install_reports, remove_reports))) => {
                     let mut installed = 0;
                     let mut replaced = 0;
                     let mut skipped = 0;
                     let mut already_ok = 0;
-                    let mut changed = Vec::new();
-
-                    for r in reports {
+                    for r in install_reports {
                         match r.action {
-                            TargetActionTaken::Installed => {
-                                installed += 1;
-                                changed.push(r.target.label());
-                            }
-                            TargetActionTaken::Replaced => {
-                                replaced += 1;
-                                changed.push(r.target.label());
-                            }
+                            TargetActionTaken::Installed => installed += 1,
+                            TargetActionTaken::Replaced => replaced += 1,
                             TargetActionTaken::Skipped => skipped += 1,
                             TargetActionTaken::AlreadyUpToDate => already_ok += 1,
                             TargetActionTaken::Removed => {}
                         }
                     }
+                    let removed = remove_reports
+                        .iter()
+                        .filter(|r| matches!(r.action, TargetActionTaken::Removed))
+                        .count();
 
                     dialog_to_close.close();
-                    overlay_toast.add_toast(adw::Toast::new(&if changed.len() <= 3
-                        && skipped == 0
-                        && already_ok == 0
-                        && !changed.is_empty()
-                    {
-                        format!("Updated {}", changed.join(", "))
-                    } else {
-                        format!(
-                            "Client configuration updated: {installed} installed, {replaced} replaced, {already_ok} identical, {skipped} skipped"
-                        )
-                    }));
+                    overlay_toast.add_toast(adw::Toast::new(&format!(
+                        "Client configuration updated: {installed} installed, {replaced} replaced, {removed} removed{}{}",
+                        if already_ok > 0 {
+                            format!(", {already_ok} identical")
+                        } else {
+                            String::new()
+                        },
+                        if skipped > 0 {
+                            format!(", {skipped} skipped")
+                        } else {
+                            String::new()
+                        },
+                    )));
                 }
                 Ok(Err(e)) => {
-                    dialog_to_close.add_toast(adw::Toast::new(&format!("Install failed: {e:#}")));
+                    dialog_to_close.add_toast(adw::Toast::new(&format!("Update failed: {e:#}")));
                 }
                 Err(e) => {
                     dialog_to_close.add_toast(adw::Toast::new(&format!("System error: {e}")));
@@ -349,9 +409,9 @@ pub fn install_to_clients_dialog(
         });
     });
 
-    // Add Install button as a centered action at bottom of page
+    // Add Apply button as a centered action at bottom of page
     let action_group = adw::PreferencesGroup::new();
-    action_group.add(&install_btn);
+    action_group.add(&apply_btn);
     page.add(&action_group);
 
     dialog.add(&page);

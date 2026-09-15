@@ -33,12 +33,23 @@ pub struct Snapshot {
     pub templates: Vec<Value>,
     pub prompts: Vec<Value>,
     pub logs: VecDeque<String>,
+    /// JSON-RPC messages proxied through the local bridge.
+    pub traffic: VecDeque<String>,
     pub revision: u64,
     pub remote_state: String,
     pub endpoint: Option<String>,
     pub local_endpoint: Option<String>,
     pub needs_restart: bool,
     pub commands: HashMap<String, String>,
+}
+
+/// A server-initiated elicitation waiting for the user interface to collect
+/// input. The dialog sends the outcome through `respond`.
+pub struct PendingElicitation {
+    pub server_id: String,
+    pub message: String,
+    pub schema: Value,
+    pub respond: tokio::sync::oneshot::Sender<CreateElicitationResult>,
 }
 impl Snapshot {
     pub fn active(&self) -> bool {
@@ -84,6 +95,7 @@ pub struct Manager {
     local_bridges: Mutex<HashMap<String, (String, CancellationToken)>>,
     command_jobs: Mutex<HashMap<(String, String), Job>>,
     operations: tokio::sync::Mutex<()>,
+    elicitations: Mutex<VecDeque<PendingElicitation>>,
     pub load_error: Option<String>,
 }
 impl Manager {
@@ -112,7 +124,7 @@ impl Manager {
         if crate::config::is_autostart_enabled() {
             settings.auto_start_login = true;
         }
-        Arc::new(Self {
+        let manager = Arc::new(Self {
             runtime,
             registry,
             settings_registry,
@@ -125,8 +137,28 @@ impl Manager {
             local_bridges: Mutex::new(HashMap::new()),
             command_jobs: Mutex::new(HashMap::new()),
             operations: tokio::sync::Mutex::new(()),
+            elicitations: Mutex::new(VecDeque::new()),
             load_error: error,
-        })
+        });
+        manager.seed_logs();
+        manager
+    }
+
+    /// Preloads the tail of each persisted log so history survives restarts.
+    fn seed_logs(self: &Arc<Self>) {
+        for server in self.servers() {
+            let path = crate::config::logs_dir().join(format!("{}.log", server.id));
+            let Ok(raw) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            let lines: Vec<String> = raw.lines().map(str::to_owned).collect();
+            let start = lines.len().saturating_sub(200);
+            self.update(&server.id, |s| {
+                for line in &lines[start..] {
+                    s.logs.push_back(line.clone());
+                }
+            });
+        }
     }
     pub fn settings(&self) -> AppSettings {
         self.settings.lock().unwrap().clone()
@@ -184,20 +216,122 @@ impl Manager {
             .unwrap_or_default()
             .as_secs()
             % 86400;
-        self.update(id, |s| {
-            for line in message.lines().take(32) {
-                s.logs.push_back(format!(
+        let lines: Vec<String> = message
+            .lines()
+            .take(32)
+            .map(|line| {
+                format!(
                     "{:02}:{:02}:{:02}  {source}  {}",
                     stamp / 3600,
                     stamp / 60 % 60,
                     stamp % 60,
                     line.chars().take(4096).collect::<String>()
-                ));
+                )
+            })
+            .collect();
+        self.update(id, |s| {
+            for line in &lines {
+                s.logs.push_back(line.clone());
             }
             while s.logs.len() > 1000 {
                 s.logs.pop_front();
             }
         });
+        persist_log_lines(id, &lines);
+    }
+
+    /// Records one bridge-proxied JSON-RPC exchange for the traffic inspector.
+    pub(crate) fn traffic(&self, id: &str, entry: String) {
+        self.update(id, |s| {
+            s.traffic.push_back(entry.chars().take(1024).collect());
+            while s.traffic.len() > 300 {
+                s.traffic.pop_front();
+            }
+        });
+    }
+
+    /// Queues a server elicitation request for the UI and waits for the answer.
+    fn elicitation_wait(
+        &self,
+        server_id: &str,
+        params: CreateElicitationRequestParam,
+    ) -> tokio::sync::oneshot::Receiver<CreateElicitationResult> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.elicitations
+            .lock()
+            .unwrap()
+            .push_back(PendingElicitation {
+                server_id: server_id.to_owned(),
+                message: params.message,
+                schema: serde_json::to_value(&params.requested_schema).unwrap_or_default(),
+                respond: tx,
+            });
+        rx
+    }
+
+    pub fn take_elicitation(&self) -> Option<PendingElicitation> {
+        self.elicitations.lock().unwrap().pop_front()
+    }
+
+    /// All headers an HTTP connection sends: literals plus keyring secrets.
+    pub async fn http_headers(&self, server: &Server) -> Result<reqwest::header::HeaderMap> {
+        let mut map = reqwest::header::HeaderMap::new();
+        if let Connection::Http {
+            headers,
+            secret_headers,
+            ..
+        } = &server.connection
+        {
+            for (key, value) in headers {
+                let name = reqwest::header::HeaderName::from_bytes(key.as_bytes())
+                    .with_context(|| format!("Invalid header name {key}"))?;
+                let value = reqwest::header::HeaderValue::from_str(value)
+                    .with_context(|| format!("Invalid value for header {key}"))?;
+                map.insert(name, value);
+            }
+            for key in secret_headers {
+                let value = SecretStore::get(
+                    &server.id,
+                    &crate::config::RemoteConfig::header_secret_name(key),
+                )
+                .await
+                .with_context(|| format!("Could not read secret header {key}"))?;
+                let name = reqwest::header::HeaderName::from_bytes(key.as_bytes())
+                    .with_context(|| format!("Invalid header name {key}"))?;
+                let value = reqwest::header::HeaderValue::from_str(&value)
+                    .with_context(|| format!("Invalid value for header {key}"))?;
+                map.insert(name, value);
+            }
+        }
+        Ok(map)
+    }
+
+    /// Blocking variant for synchronous UI code; only call off the runtime.
+    pub fn resolved_headers(
+        &self,
+        server: &Server,
+    ) -> Result<std::collections::BTreeMap<String, String>> {
+        self.runtime.block_on(async {
+            let mut out = std::collections::BTreeMap::new();
+            if let Connection::Http {
+                headers,
+                secret_headers,
+                ..
+            } = &server.connection
+            {
+                out.extend(headers.iter().map(|(k, v)| (k.clone(), v.clone())));
+                for key in secret_headers {
+                    let value = SecretStore::get(
+                        &server.id,
+                        &crate::config::RemoteConfig::header_secret_name(key),
+                    )
+                    .await
+                    .with_context(|| format!("Could not read secret header {key}"))?;
+                    out.insert(key.clone(), value);
+                }
+            }
+            Ok(out)
+        })
     }
     pub async fn save(&self, server: Server, secret_changes: Vec<(String, String)>) -> Result<()> {
         let _guard = self.operations.lock().await;
@@ -214,15 +348,32 @@ impl Manager {
                 .context("Could not save to Secret Service")?;
         }
         let mut definitions = self.servers();
-        let removed: Vec<_> = definitions
+        let removed: Vec<String> = definitions
             .iter()
             .find(|s| s.id == server.id)
             .map(|s| {
-                s.secrets
+                let mut keys: Vec<String> = s
+                    .secrets
                     .iter()
                     .filter(|key| !server.secrets.contains(key))
                     .cloned()
-                    .collect()
+                    .collect();
+                if let (
+                    Connection::Http {
+                        secret_headers: old, ..
+                    },
+                    Connection::Http {
+                        secret_headers: new, ..
+                    },
+                ) = (&s.connection, &server.connection)
+                {
+                    keys.extend(
+                        old.iter()
+                            .filter(|key| !new.contains(key))
+                            .map(|key| RemoteConfig::header_secret_name(key)),
+                    );
+                }
+                keys
             })
             .unwrap_or_default();
         let server_id = server.id.clone();
@@ -261,7 +412,18 @@ impl Manager {
         definitions.retain(|s| s.id != id);
         self.registry.save(&definitions)?;
         *self.definitions.lock().unwrap() = definitions;
-        for key in server.secrets.iter().map(String::as_str).chain([
+        let mut keys: Vec<String> = server.secrets.clone();
+        if let Connection::Http {
+            secret_headers, ..
+        } = &server.connection
+        {
+            keys.extend(
+                secret_headers
+                    .iter()
+                    .map(|h| RemoteConfig::header_secret_name(h)),
+            );
+        }
+        for key in keys.iter().map(String::as_str).chain([
             "remote-token",
             "remote-token-openai",
             "remote-token-ngrok",
@@ -499,6 +661,54 @@ impl Manager {
         self.stop_inner(id).await;
         self.start_inner(id).await
     }
+    /// Starts every configured server, returning the first failure if any.
+    pub async fn start_all(self: &Arc<Self>) -> Result<()> {
+        let _guard = self.operations.lock().await;
+        let mut first_error = None;
+        for server in self.servers() {
+            if let Err(e) = self.start_inner(&server.id).await
+                && first_error.is_none()
+            {
+                first_error = Some(format!("{}: {e:#}", server.name));
+            }
+        }
+        match first_error {
+            Some(e) => bail!(e),
+            None => Ok(()),
+        }
+    }
+    /// Stops every running server.
+    pub async fn stop_all(self: &Arc<Self>) -> Result<()> {
+        let _guard = self.operations.lock().await;
+        for server in self.servers() {
+            self.stop_commands(&server.id).await;
+            self.stop_inner(&server.id).await;
+        }
+        Ok(())
+    }
+    /// Starts the servers listed in a saved profile.
+    pub async fn start_profile(self: &Arc<Self>, name: &str) -> Result<()> {
+        let profile = self
+            .settings()
+            .profiles
+            .iter()
+            .find(|p| p.name == name)
+            .cloned()
+            .ok_or_else(|| anyhow!("Unknown profile {name}"))?;
+        let _guard = self.operations.lock().await;
+        let mut first_error = None;
+        for id in &profile.servers {
+            if let Err(e) = self.start_inner(id).await
+                && first_error.is_none()
+            {
+                first_error = Some(format!("{id}: {e:#}"));
+            }
+        }
+        match first_error {
+            Some(e) => bail!(e),
+            None => Ok(()),
+        }
+    }
     pub async fn shutdown(self: &Arc<Self>) -> Result<()> {
         let _guard = self.operations.lock().await;
         for s in self.servers() {
@@ -568,14 +778,30 @@ impl Manager {
                         None,
                         redactions,
                     )));
-                    ().serve((read, stdin))
+                    let handler = ClientService::new(self.clone(), id);
+                    handler
+                        .serve((read, stdin))
                         .await
                         .context("MCP initialization failed")?
                 }
-                Connection::Http { url } => ()
-                    .serve(StreamableHttpClientTransport::from_uri(url.clone()))
-                    .await
-                    .context("Could not connect to the HTTP MCP endpoint")?,
+                Connection::Http { url, .. } => {
+                    let headers = self
+                        .http_headers(server)
+                        .await
+                        .context("Could not prepare request headers")?;
+                    let client = reqwest::Client::builder()
+                        .default_headers(headers)
+                        .build()?;
+                    let transport =
+                        StreamableHttpClientTransport::with_client(
+                            client,
+                            rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig::with_uri(url.clone()),
+                        );
+                    ClientService::new(self.clone(), id)
+                        .serve(transport)
+                        .await
+                        .context("Could not connect to the HTTP MCP endpoint")?
+                }
             };
             Ok::<_, anyhow::Error>(session)
         };
@@ -812,8 +1038,16 @@ impl Manager {
         };
 
         let address = listener.local_addr()?;
+        let manager = self.clone();
+        let bridge_id = id.to_owned();
         let service = StreamableHttpService::new(
-            move || Ok(Bridge { peer: peer.clone() }),
+            move || {
+                Ok(Bridge {
+                    peer: peer.clone(),
+                    manager: manager.clone(),
+                    id: bridge_id.clone(),
+                })
+            },
             Arc::new(LocalSessionManager::default()),
             Default::default(),
         );
@@ -945,6 +1179,38 @@ async fn bridge_compatibility(
         .await
 }
 
+/// Appends rendered log lines to `logs/<id>.log`, trimming the file to its
+/// last megabyte when it grows past two megabytes.
+fn persist_log_lines(id: &str, lines: &[String]) {
+    use std::io::Write;
+    if lines.is_empty() {
+        return;
+    }
+    let dir = crate::config::logs_dir();
+    if std::fs::create_dir_all(&dir).is_err() {
+        return;
+    }
+    let path = dir.join(format!("{id}.log"));
+    const LIMIT: u64 = 2 * 1024 * 1024;
+    const KEEP: usize = 1024 * 1024;
+    if std::fs::metadata(&path).is_ok_and(|m| m.len() > LIMIT)
+        && let Ok(raw) = std::fs::read(&path)
+    {
+        let tail = &raw[raw.len().saturating_sub(KEEP)..];
+        let start = tail
+            .iter()
+            .position(|b| *b == b'\n')
+            .map(|i| i + 1)
+            .unwrap_or(0);
+        let _ = std::fs::write(&path, &tail[start..]);
+    }
+    if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+        for line in lines {
+            let _ = writeln!(file, "{line}");
+        }
+    }
+}
+
 pub(crate) struct ProcessGroup(pub u32);
 impl ProcessGroup {
     pub fn terminate(&self) {
@@ -1033,9 +1299,93 @@ fn redact_chunk(pending: &mut Vec<u8>, secrets: &[String], eof: bool) -> String 
     String::from_utf8_lossy(&output).into_owned()
 }
 
+/// Marshal's own MCP client face: answers elicitation requests through the
+/// UI, relays server log notifications into the log view, and re-runs
+/// discovery when list-changed notifications arrive.
+#[derive(Clone)]
+struct ClientService {
+    manager: Arc<Manager>,
+    id: String,
+}
+impl ClientService {
+    fn new(manager: Arc<Manager>, id: &str) -> Self {
+        Self {
+            manager,
+            id: id.to_owned(),
+        }
+    }
+}
+impl rmcp::ClientHandler for ClientService {
+    fn get_info(&self) -> ClientInfo {
+        let mut info = ClientInfo::default();
+        info.capabilities.elicitation = Some(ElicitationCapability::default());
+        info.client_info = Implementation {
+            name: "Marshal".into(),
+            version: env!("CARGO_PKG_VERSION").into(),
+            ..Default::default()
+        };
+        info
+    }
+    async fn create_elicitation(
+        &self,
+        params: CreateElicitationRequestParam,
+        _context: RequestContext<RoleClient>,
+    ) -> Result<CreateElicitationResult, rmcp::ErrorData> {
+        let message = params.message.clone();
+        let rx = self.manager.elicitation_wait(&self.id, params);
+        self.manager.log(&self.id, "Server", &format!("Requests input: {message}"));
+        match tokio::time::timeout(Duration::from_secs(300), rx).await {
+            Ok(Ok(result)) => Ok(result),
+            Ok(Err(_)) | Err(_) => Ok(CreateElicitationResult {
+                action: ElicitationAction::Decline,
+                content: None,
+            }),
+        }
+    }
+    async fn on_logging_message(
+        &self,
+        params: LoggingMessageNotificationParam,
+        _context: NotificationContext<RoleClient>,
+    ) {
+        let text = params
+            .data
+            .as_str()
+            .map(str::to_owned)
+            .unwrap_or_else(|| params.data.to_string());
+        self.manager.log(
+            &self.id,
+            "Server",
+            &format!("{:?}: {}", params.level, text),
+        );
+    }
+    async fn on_tool_list_changed(&self, _context: NotificationContext<RoleClient>) {
+        let manager = self.manager.clone();
+        let id = self.id.clone();
+        tokio::spawn(async move {
+            let _ = manager.discover(&id).await;
+        });
+    }
+    async fn on_resource_list_changed(&self, _context: NotificationContext<RoleClient>) {
+        let manager = self.manager.clone();
+        let id = self.id.clone();
+        tokio::spawn(async move {
+            let _ = manager.discover(&id).await;
+        });
+    }
+    async fn on_prompt_list_changed(&self, _context: NotificationContext<RoleClient>) {
+        let manager = self.manager.clone();
+        let id = self.id.clone();
+        tokio::spawn(async move {
+            let _ = manager.discover(&id).await;
+        });
+    }
+}
+
 #[derive(Clone)]
 struct Bridge {
     peer: Peer<RoleClient>,
+    manager: Arc<Manager>,
+    id: String,
 }
 impl Service<RoleServer> for Bridge {
     async fn handle_request(
@@ -1047,16 +1397,43 @@ impl Service<RoleServer> for Bridge {
             context.peer.set_peer_info(request.params);
             return Ok(ServerResult::InitializeResult(self.get_info()));
         }
-        tokio::time::timeout(Duration::from_secs(60), self.peer.send_request(request))
-            .await
-            .map_err(|_| rmcp::ErrorData::internal_error("Upstream timed out", None))?
-            .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))
+        let description = serde_json::to_value(&request)
+            .ok()
+            .and_then(|v| {
+                let method = v["method"].as_str()?.to_owned();
+                let params = v["params"].to_string();
+                Some(format!(
+                    "{method} {}",
+                    params.chars().take(120).collect::<String>()
+                ))
+            })
+            .unwrap_or_else(|| "request".into());
+        let started = Instant::now();
+        let result =
+            tokio::time::timeout(Duration::from_secs(60), self.peer.send_request(request))
+                .await
+                .map_err(|_| rmcp::ErrorData::internal_error("Upstream timed out", None))?
+                .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None));
+        self.manager.traffic(
+            &self.id,
+            format!(
+                "{description} → {} · {}ms",
+                if result.is_ok() { "OK" } else { "error" },
+                started.elapsed().as_millis()
+            ),
+        );
+        result
     }
     async fn handle_notification(
         &self,
-        _notification: ClientNotification,
+        notification: ClientNotification,
         _context: NotificationContext<RoleServer>,
     ) -> Result<(), rmcp::ErrorData> {
+        let method = serde_json::to_value(&notification)
+            .ok()
+            .and_then(|v| v["method"].as_str().map(str::to_owned))
+            .unwrap_or_else(|| "notification".into());
+        self.manager.traffic(&self.id, format!("{method} → notified"));
         Ok(())
     }
     fn get_info(&self) -> ServerInfo {
@@ -1108,6 +1485,7 @@ mod tests {
             local_bridges: Mutex::new(HashMap::new()),
             command_jobs: Mutex::new(HashMap::new()),
             operations: tokio::sync::Mutex::new(()),
+            elicitations: Mutex::new(VecDeque::new()),
             load_error: None,
         });
         let server = Server {
