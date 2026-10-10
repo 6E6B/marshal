@@ -26,6 +26,8 @@ pub struct RemoteConfig {
     pub tunnel_id: String,
     pub domain: String,
     #[serde(default)]
+    pub cloudflare_hostname: String,
+    #[serde(default)]
     pub start_with_server: bool,
 }
 
@@ -34,6 +36,7 @@ impl RemoteConfig {
         match provider {
             "openai" => Some("remote-token-openai"),
             "ngrok" => Some("remote-token-ngrok"),
+            "cloudflare-named" => Some("remote-token-cloudflare"),
             _ => None,
         }
     }
@@ -41,7 +44,10 @@ impl RemoteConfig {
     pub fn is_credential_name(name: &str) -> bool {
         matches!(
             name,
-            "remote-token" | "remote-token-openai" | "remote-token-ngrok"
+            "remote-token"
+                | "remote-token-openai"
+                | "remote-token-ngrok"
+                | "remote-token-cloudflare"
         )
     }
 
@@ -58,6 +64,41 @@ impl RemoteConfig {
             bail!("Enter the tunnel ID from OpenAI Platform settings");
         }
         Ok(())
+    }
+
+    /// A named tunnel's public hostname, not a URL containing credentials or a path.
+    pub fn cloudflare_public_url(hostname: &str) -> Result<reqwest::Url> {
+        let hostname = hostname.trim();
+        let text = if hostname.contains("://") {
+            hostname.to_owned()
+        } else {
+            format!("https://{hostname}")
+        };
+        let url = reqwest::Url::parse(&text)
+            .context("Enter the public hostname configured in Cloudflare")?;
+        if url.scheme() != "https"
+            || !url.username().is_empty()
+            || url.password().is_some()
+            || url.port().is_some()
+            || url.path() != "/"
+            || url.query().is_some()
+            || url.fragment().is_some()
+            || !url.host_str().is_some_and(|host| {
+                host.contains('.')
+                    && host.len() <= 253
+                    && host.parse::<std::net::IpAddr>().is_err()
+                    && host.split('.').all(|label| {
+                        !label.is_empty()
+                            && label.len() <= 63
+                            && !label.starts_with('-')
+                            && !label.ends_with('-')
+                            && label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+                    })
+            })
+        {
+            bail!("Enter a public hostname such as mcp.example.com, without a path or credentials");
+        }
+        Ok(url)
     }
 }
 
@@ -444,6 +485,12 @@ mod tests {
             RemoteConfig::credential_name("openai"),
             RemoteConfig::credential_name("ngrok")
         );
+        assert_eq!(
+            RemoteConfig::credential_name("cloudflare-named"),
+            Some("remote-token-cloudflare")
+        );
+        assert_eq!(RemoteConfig::credential_name("cloudflare"), None);
+        assert!(RemoteConfig::is_credential_name("remote-token-cloudflare"));
         assert!(RemoteConfig::is_credential_name("remote-token"));
         assert!(!RemoteConfig::is_credential_name("DATABASE_URL"));
         assert!(
@@ -462,6 +509,35 @@ mod tests {
         }))
         .unwrap();
         assert!(!remote.start_with_server);
+        assert!(remote.cloudflare_hostname.is_empty());
+    }
+
+    #[test]
+    fn cloudflare_hostnames_require_a_public_https_origin() {
+        for hostname in ["mcp.example.com", " https://mcp.example.com/ "] {
+            assert_eq!(
+                RemoteConfig::cloudflare_public_url(hostname)
+                    .unwrap()
+                    .as_str(),
+                "https://mcp.example.com/"
+            );
+        }
+        for hostname in [
+            "",
+            "localhost",
+            "127.0.0.1",
+            "http://mcp.example.com",
+            "https://user:secret@mcp.example.com",
+            "mcp.example.com:8443",
+            "mcp.example.com/mcp",
+            "mcp.example.com?token=secret",
+            "mcp.example.com#fragment",
+        ] {
+            assert!(
+                RemoteConfig::cloudflare_public_url(hostname).is_err(),
+                "Accepted invalid hostname: {hostname}"
+            );
+        }
     }
 
     #[test]

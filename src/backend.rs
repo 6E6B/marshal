@@ -427,6 +427,7 @@ impl Manager {
             "remote-token",
             "remote-token-openai",
             "remote-token-ngrok",
+            "remote-token-cloudflare",
         ]) {
             if let Err(e) = SecretStore::delete(id, key).await {
                 self.log(id, "Keyring", &e.to_string());

@@ -9,7 +9,6 @@ use tokio_util::sync::CancellationToken;
 
 /// What `probe` needs from the run loop.
 pub struct Probe<'a> {
-    pub manager: &'a Manager,
     pub server: &'a Server,
     /// Local bridge URL the tunnel forwards to.
     pub endpoint: &'a str,
@@ -58,6 +57,7 @@ fn endpoint_path(endpoint: &str) -> String {
 pub struct OpenAITunnelProvider;
 pub struct NgrokProvider;
 pub struct CloudflareProvider;
+pub struct CloudflareNamedProvider;
 pub struct TailscaleProvider;
 
 impl TunnelProvider for OpenAITunnelProvider {
@@ -140,7 +140,13 @@ impl TunnelProvider for NgrokProvider {
                             .map(str::to_owned)
                     })
                 })
-                .map(|url| format!("{}{}", url.trim_end_matches('/'), endpoint_path(ctx.endpoint))))
+                .map(|url| {
+                    format!(
+                        "{}{}",
+                        url.trim_end_matches('/'),
+                        endpoint_path(ctx.endpoint)
+                    )
+                }))
         })
     }
 }
@@ -172,24 +178,78 @@ impl TunnelProvider for CloudflareProvider {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Option<String>>> + Send + 'a>>
     {
         Box::pin(async move {
-            let ready = http_probe(http, health, "/ready").await?.is_some();
-            if !ready {
+            if !http
+                .get(format!("http://{health}/ready"))
+                .send()
+                .await
+                .context("Cloudflare readiness probe failed")?
+                .status()
+                .is_success()
+            {
                 return Ok(None);
             }
-            // Quick tunnels have no API for the assigned URL; cloudflared
-            // prints it once the connection registers.
-            let logs = ctx.manager.snapshot(&ctx.server.id).logs;
-            let url = logs.iter().rev().find_map(|line| {
-                let start = line.find("https://")?;
-                let rest = &line[start..];
-                let end = rest
-                    .find(|c: char| c.is_whitespace() || c == '"')
-                    .unwrap_or(rest.len());
-                rest[..end].contains("trycloudflare.com").then(|| {
-                    format!("{}{}", rest[..end].trim_end_matches('/'), endpoint_path(ctx.endpoint))
-                })
-            });
-            Ok(url)
+            // Read this process's assigned hostname rather than reusing a URL
+            // from a previous tunnel's logs.
+            let Some(data) = http_probe(http, health, "/quicktunnel").await? else {
+                return Ok(None);
+            };
+            let Some(hostname) = data["hostname"].as_str().filter(|host| !host.is_empty()) else {
+                return Ok(None);
+            };
+            let mut url = RemoteConfig::cloudflare_public_url(hostname)?;
+            if !url
+                .host_str()
+                .is_some_and(|host| host.ends_with(".trycloudflare.com"))
+            {
+                bail!("cloudflared returned an invalid Quick Tunnel hostname");
+            }
+            url.set_path(&endpoint_path(ctx.endpoint));
+            Ok(Some(url.into()))
+        })
+    }
+}
+
+impl TunnelProvider for CloudflareNamedProvider {
+    fn command(
+        &self,
+        server: &Server,
+        _endpoint: &str,
+        token: &str,
+        health: &str,
+    ) -> Result<crate::host::Command> {
+        RemoteConfig::cloudflare_public_url(&server.remote.cloudflare_hostname)?;
+        if token.trim().is_empty() {
+            bail!("Save this Cloudflare tunnel's token in the keyring first");
+        }
+        let mut command = crate::host::tokio_command("cloudflared");
+        command
+            .args(["tunnel", "--metrics", health, "--no-autoupdate", "run"])
+            .env("TUNNEL_TOKEN", token);
+        Ok(command)
+    }
+
+    fn probe<'a>(
+        &'a self,
+        http: &'a reqwest::Client,
+        health: &'a str,
+        ctx: &'a Probe<'a>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Option<String>>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            if !http
+                .get(format!("http://{health}/ready"))
+                .send()
+                .await
+                .context("Cloudflare readiness probe failed")?
+                .status()
+                .is_success()
+            {
+                return Ok(None);
+            }
+            let mut url =
+                RemoteConfig::cloudflare_public_url(&ctx.server.remote.cloudflare_hostname)?;
+            url.set_path(&endpoint_path(ctx.endpoint));
+            Ok(Some(url.into()))
         })
     }
 }
@@ -253,6 +313,7 @@ fn provider_for(name: &str) -> Result<Box<dyn TunnelProvider>> {
         "openai" => Ok(Box::new(OpenAITunnelProvider)),
         "ngrok" => Ok(Box::new(NgrokProvider)),
         "cloudflare" => Ok(Box::new(CloudflareProvider)),
+        "cloudflare-named" => Ok(Box::new(CloudflareNamedProvider)),
         "tailscale" => Ok(Box::new(TailscaleProvider)),
         _ => bail!("Choose a tunnel provider"),
     }
@@ -264,15 +325,34 @@ pub async fn run(manager: Arc<Manager>, server: &Server, cancel: CancellationTok
         Some(credential_name) => {
             if SecretStore::contains(&server.id, credential_name).await? {
                 SecretStore::get(&server.id, credential_name).await
-            } else {
+            } else if server.remote.provider != "cloudflare-named" {
                 // Configurations created before provider-specific credentials used this key.
                 SecretStore::get(&server.id, "remote-token").await
+            } else {
+                SecretStore::get(&server.id, credential_name).await
             }
             .context("Save this provider’s credential in the keyring first")?
         }
         None => String::new(),
     };
-    let endpoint = manager.bridge(&server.id, cancel.clone()).await?;
+    let endpoint = if server.remote.provider == "cloudflare-named" {
+        // Remotely managed ingress rules target a configured origin. Reuse the
+        // persistent local bridge instead of a random port and route per run.
+        let endpoint = manager.ensure_local_bridge(&server.id).await?;
+        manager.log(
+            &server.id,
+            "Tunnel",
+            &format!(
+                "Configure the Cloudflare public hostname's HTTP service as {}",
+                reqwest::Url::parse(&endpoint)?
+                    .origin()
+                    .ascii_serialization()
+            ),
+        );
+        endpoint
+    } else {
+        manager.bridge(&server.id, cancel.clone()).await?
+    };
     // Provider agents require a fixed health port. Reserve it until immediately before spawn.
     let health_socket = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let address = health_socket.local_addr()?.to_string();
@@ -355,7 +435,7 @@ pub async fn run(manager: Arc<Manager>, server: &Server, cancel: CancellationTok
             status = child.wait() => bail!("Tunnel client exited: {}", status?),
             _ = cancel.cancelled() => return Ok(()),
             _ = timer.tick() => {
-                let ctx = Probe { manager: &manager, server, endpoint: &endpoint };
+                let ctx = Probe { server, endpoint: &endpoint };
                 match provider.probe(&client, &address, &ctx).await {
                     Ok(remote) => {
                         manager.update(&server.id, |s| {
@@ -417,8 +497,14 @@ mod tests {
             .command(&server, endpoint, "", "127.0.0.1:1235")
             .unwrap();
         let args: Vec<_> = cloudflare.as_std().get_args().collect();
-        assert!(args.windows(2).any(|w| w == ["--url", "http://127.0.0.1:1234"]));
-        assert!(args.windows(2).any(|w| w == ["--metrics", "127.0.0.1:1235"]));
+        assert!(
+            args.windows(2)
+                .any(|w| w == ["--url", "http://127.0.0.1:1234"])
+        );
+        assert!(
+            args.windows(2)
+                .any(|w| w == ["--metrics", "127.0.0.1:1235"])
+        );
         let tailscale = TailscaleProvider
             .command(&server, endpoint, "", "127.0.0.1:1235")
             .unwrap();
@@ -426,7 +512,190 @@ mod tests {
         assert_eq!(args[0], "funnel");
         assert!(args.iter().any(|a| *a == "http://127.0.0.1:1234"));
         assert!(provider_for("cloudflare").is_ok());
+        assert!(provider_for("cloudflare-named").is_ok());
         assert!(provider_for("tailscale").is_ok());
         assert!(provider_for("nope").is_err());
+    }
+
+    fn cloudflare_server() -> Server {
+        let mut server: Server = serde_json::from_value(serde_json::json!({
+            "id": "fixture", "name": "Fixture",
+            "connection": { "transport": "http", "url": "http://localhost:3000/mcp" }
+        }))
+        .unwrap();
+        server.remote.cloudflare_hostname = "mcp.example.com".into();
+        server
+    }
+
+    #[test]
+    fn named_cloudflare_command_uses_a_keyring_token_not_arguments() {
+        let server = cloudflare_server();
+        let command = CloudflareNamedProvider
+            .command(
+                &server,
+                "http://127.0.0.1:1234/fixture/mcp",
+                "private-token",
+                "127.0.0.1:1235",
+            )
+            .unwrap();
+        let command = command.as_std();
+        assert_eq!(command.get_program(), "cloudflared");
+        assert_eq!(
+            command.get_args().collect::<Vec<_>>(),
+            vec![
+                "tunnel",
+                "--metrics",
+                "127.0.0.1:1235",
+                "--no-autoupdate",
+                "run"
+            ]
+        );
+        assert!(command.get_envs().any(|(key, value)| {
+            key == "TUNNEL_TOKEN" && value == Some(std::ffi::OsStr::new("private-token"))
+        }));
+        assert!(
+            CloudflareNamedProvider
+                .command(&server, "", "", "127.0.0.1:1235")
+                .is_err()
+        );
+        let mut invalid = server;
+        invalid.remote.cloudflare_hostname = "http://mcp.example.com/private".into();
+        assert!(
+            CloudflareNamedProvider
+                .command(&invalid, "", "token", "127.0.0.1:1235")
+                .is_err()
+        );
+    }
+
+    struct Metrics {
+        address: String,
+        task: tokio::task::JoinHandle<()>,
+    }
+
+    impl Drop for Metrics {
+        fn drop(&mut self) {
+            self.task.abort();
+        }
+    }
+
+    async fn metrics(ready: axum::http::StatusCode, hostname: &'static str) -> Metrics {
+        let router = axum::Router::new()
+            // Readiness is determined by status, even with a non-JSON body.
+            .route(
+                "/ready",
+                axum::routing::get(move || async move { (ready, "ready") }),
+            )
+            .route(
+                "/quicktunnel",
+                axum::routing::get(move || async move {
+                    axum::Json(serde_json::json!({ "hostname": hostname }))
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        let task = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        Metrics { address, task }
+    }
+
+    #[tokio::test]
+    async fn quick_cloudflare_reads_the_current_hostname_and_preserves_the_bridge_path() {
+        let metrics = metrics(
+            axum::http::StatusCode::OK,
+            "current-tunnel.trycloudflare.com",
+        )
+        .await;
+        let server = cloudflare_server();
+        let ctx = Probe {
+            server: &server,
+            endpoint: "http://127.0.0.1:1234/private-route/mcp",
+        };
+        let remote = CloudflareProvider
+            .probe(&reqwest::Client::new(), &metrics.address, &ctx)
+            .await
+            .unwrap();
+        assert_eq!(
+            remote.as_deref(),
+            Some("https://current-tunnel.trycloudflare.com/private-route/mcp")
+        );
+    }
+
+    #[tokio::test]
+    async fn cloudflare_does_not_publish_an_endpoint_until_ready() {
+        let metrics = metrics(
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            "current.trycloudflare.com",
+        )
+        .await;
+        let server = cloudflare_server();
+        let ctx = Probe {
+            server: &server,
+            endpoint: "http://127.0.0.1:1234/fixture/mcp",
+        };
+        let http = reqwest::Client::new();
+        assert!(
+            CloudflareProvider
+                .probe(&http, &metrics.address, &ctx)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            CloudflareNamedProvider
+                .probe(&http, &metrics.address, &ctx)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn quick_cloudflare_rejects_missing_and_untrusted_hostnames() {
+        let server = cloudflare_server();
+        let ctx = Probe {
+            server: &server,
+            endpoint: "http://127.0.0.1:1234/private/mcp",
+        };
+        let http = reqwest::Client::new();
+        let empty = metrics(axum::http::StatusCode::OK, "").await;
+        assert!(
+            CloudflareProvider
+                .probe(&http, &empty.address, &ctx)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        for hostname in [
+            "trycloudflare.com.evil.example",
+            "https://private@demo.trycloudflare.com",
+            "demo.trycloudflare.com/other",
+        ] {
+            let metrics = metrics(axum::http::StatusCode::OK, hostname).await;
+            assert!(
+                CloudflareProvider
+                    .probe(&http, &metrics.address, &ctx)
+                    .await
+                    .is_err()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn named_cloudflare_uses_the_configured_hostname_and_stable_route() {
+        let metrics = metrics(axum::http::StatusCode::OK, "").await;
+        let server = cloudflare_server();
+        let ctx = Probe {
+            server: &server,
+            endpoint: "http://127.0.0.1:1234/fixture/mcp",
+        };
+        assert_eq!(
+            CloudflareNamedProvider
+                .probe(&reqwest::Client::new(), &metrics.address, &ctx)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("https://mcp.example.com/fixture/mcp")
+        );
     }
 }
