@@ -613,6 +613,7 @@ fn provider_index(provider: &str) -> u32 {
         "ngrok" => 2,
         "cloudflare" => 3,
         "tailscale" => 4,
+        "cloudflare-named" => 5,
         _ => 0,
     }
 }
@@ -622,6 +623,7 @@ fn provider_id(index: u32) -> &'static str {
         2 => "ngrok",
         3 => "cloudflare",
         4 => "tailscale",
+        5 => "cloudflare-named",
         _ => "",
     }
 }
@@ -1668,6 +1670,7 @@ impl Ui {
                 "ngrok",
                 "Cloudflare Quick Tunnel",
                 "Tailscale Funnel",
+                "Cloudflare Named Tunnel",
             ]))
             .selected(provider_index(&server.remote.provider))
             .build();
@@ -1706,7 +1709,9 @@ impl Ui {
                 return;
             }
             match selected {
-                "openai" | "ngrok" => ui.tunnel_setup(&id, selected, row, sync.clone()),
+                "openai" | "ngrok" | "cloudflare-named" => {
+                    ui.tunnel_setup(&id, selected, row, sync.clone())
+                }
                 // Quick tunnels and tailscale funnel need no credentials; the
                 // CLIs must simply exist on PATH.
                 _ => ui.save_provider(&id, selected, row, sync.clone()),
@@ -1718,7 +1723,9 @@ impl Ui {
         configure.connect_clicked(move |_| {
             let selected = provider_id(row.selected());
             match selected {
-                "openai" | "ngrok" => ui.tunnel_setup(&id, selected, &row, syncing.clone()),
+                "openai" | "ngrok" | "cloudflare-named" => {
+                    ui.tunnel_setup(&id, selected, &row, syncing.clone())
+                }
                 _ => ui.save_provider(&id, selected, &row, syncing.clone()),
             }
         });
@@ -1826,9 +1833,14 @@ impl Ui {
                 "Enable Remote Access"
             });
             let configured = m.server(&id).is_ok_and(|server| {
+                group.set_description(match server.remote.provider.as_str() {
+                    "cloudflare" => Some("Quick Tunnels are temporary and do not support SSE. Anyone with the endpoint can use this server's tools. Use a named tunnel with Cloudflare Access for persistent remote access."),
+                    "cloudflare-named" => Some("Configure the public hostname's HTTP service with the local origin shown in Provider Settings. Protect access to the server with a Cloudflare Access policy."),
+                    _ => None,
+                });
                 matches!(
                     server.remote.provider.as_str(),
-                    "openai" | "ngrok" | "cloudflare" | "tailscale"
+                    "openai" | "ngrok" | "cloudflare" | "tailscale" | "cloudflare-named"
                 )
             });
             toggle.set_sensitive(!busy.get() && (active || (s.state == "Running" && configured)));
@@ -1860,20 +1872,25 @@ impl Ui {
             return;
         };
         let openai = provider == "openai";
+        let cloudflare = provider == "cloudflare-named";
         let same_provider = server.remote.provider == provider;
         let dialog = adw::PreferencesDialog::builder()
             .title(if openai {
                 "Set Up OpenAI Tunnel"
+            } else if cloudflare {
+                "Set Up Cloudflare Tunnel"
             } else {
                 "Set Up ngrok"
             })
             .content_width(480)
-            .content_height(360)
+            .content_height(if cloudflare { 480 } else { 360 })
             .build();
         let page = adw::PreferencesPage::new();
         let fields = adw::PreferencesGroup::builder()
             .description(if openai {
                 "Enter your tunnel ID and runtime API key from OpenAI Platform."
+            } else if cloudflare {
+                "Install cloudflared on the host. Enter the token and public hostname of a remotely managed tunnel. Configure its HTTP service with the origin below and protect it with Cloudflare Access; anyone with the endpoint can otherwise use this server's tools."
             } else {
                 "Enter your ngrok authtoken. Anyone with the public endpoint can use this server’s tools unless you configure access restrictions in ngrok."
             })
@@ -1881,20 +1898,58 @@ impl Ui {
         let detail = adw::EntryRow::builder()
             .title(if openai {
                 "Tunnel ID"
+            } else if cloudflare {
+                "Public Hostname"
             } else {
                 "Public Domain (Optional)"
             })
             .text(if openai {
                 &server.remote.tunnel_id
+            } else if cloudflare {
+                &server.remote.cloudflare_hostname
             } else {
                 &server.remote.domain
             })
             .build();
         let credential = adw::PasswordEntryRow::builder()
-            .title(if openai { "API Key" } else { "Authtoken" })
+            .title(if openai {
+                "API Key"
+            } else if cloudflare {
+                "Tunnel Token"
+            } else {
+                "Authtoken"
+            })
             .build();
         fields.add(&detail);
         fields.add(&credential);
+        if cloudflare {
+            let origin = self
+                .manager
+                .snapshot(id)
+                .local_endpoint
+                .and_then(|endpoint| reqwest::Url::parse(&endpoint).ok())
+                .map(|url| url.origin().ascii_serialization());
+            let origin_row = adw::ActionRow::builder()
+                .title("Cloudflare HTTP Service")
+                .subtitle(
+                    origin
+                        .as_deref()
+                        .unwrap_or("Start the server to see its local origin"),
+                )
+                .subtitle_selectable(true)
+                .build();
+            origin_row.set_use_markup(false);
+            if let Some(origin) = origin {
+                let copy = gtk::Button::builder()
+                    .icon_name("edit-copy-symbolic")
+                    .tooltip_text("Copy Origin")
+                    .valign(gtk::Align::Center)
+                    .build();
+                copy.connect_clicked(move |button| button.clipboard().set_text(&origin));
+                origin_row.add_suffix(&copy);
+            }
+            fields.add(&origin_row);
+        }
         page.add(&fields);
         let actions = adw::PreferencesGroup::new();
         let buttons = gtk::Box::new(gtk::Orientation::Horizontal, 12);
@@ -1941,6 +1996,7 @@ impl Ui {
                     .await
                     .map(Some)
             } else if same_provider
+                && !cloudflare
                 && crate::secrets::SecretStore::contains(&server_id, "remote-token").await?
             {
                 // Read the former shared entry once so saving this dialog migrates it.
@@ -2005,10 +2061,19 @@ impl Ui {
                 detail.grab_focus();
                 return;
             }
+            if cloudflare && RemoteConfig::cloudflare_public_url(&detail_value).is_err() {
+                dialog.add_toast(adw::Toast::new(
+                    "Enter a public hostname such as mcp.example.com",
+                ));
+                detail.grab_focus();
+                return;
+            }
             let value = credential.text().trim().to_owned();
             if value.is_empty() {
                 dialog.add_toast(adw::Toast::new(if openai {
                     "Enter an API key"
+                } else if cloudflare {
+                    "Enter a tunnel token"
                 } else {
                     "Enter an authtoken"
                 }));
@@ -2021,6 +2086,8 @@ impl Ui {
             server.remote.provider = provider.clone();
             if openai {
                 server.remote.tunnel_id = detail_value;
+            } else if cloudflare {
+                server.remote.cloudflare_hostname = detail_value;
             } else {
                 server.remote.domain = detail_value;
             }
@@ -2054,6 +2121,8 @@ impl Ui {
                         dialog.close();
                         ui.overlay.add_toast(adw::Toast::new(if openai {
                             "OpenAI tunnel configured"
+                        } else if cloudflare {
+                            "Cloudflare tunnel configured"
                         } else {
                             "ngrok configured"
                         }));
@@ -3880,6 +3949,135 @@ mod tests {
             .unwrap();
     }
     #[test]
+    fn tunnel_provider_selection_is_backward_compatible() {
+        for (index, id) in [
+            (0, ""),
+            (1, "openai"),
+            (2, "ngrok"),
+            (3, "cloudflare"),
+            (4, "tailscale"),
+            (5, "cloudflare-named"),
+        ] {
+            assert_eq!(provider_index(id), index);
+            assert_eq!(provider_id(index), id);
+        }
+    }
+
+    #[test]
+    #[ignore = "Requires a graphical desktop; opens a temporary test window"]
+    fn cloudflare_named_setup_renders_and_validates() {
+        adw::init().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let manager = Manager::with_registry(
+            Arc::new(tokio::runtime::Runtime::new().unwrap()),
+            crate::config::ServerRegistry::at(dir.path().join("servers.json")),
+        );
+        let server: Server = serde_json::from_value(json!({
+            "id": "ui-fixture", "name": "Cloudflare Fixture",
+            "connection": {
+                "transport": "stdio", "executable": "python3",
+                "arguments": [format!("{}/tests/fixtures/mcp_server.py", env!("CARGO_MANIFEST_DIR"))],
+                "directory": ""
+            }
+        })).unwrap();
+        manager
+            .runtime
+            .block_on(manager.save(server, vec![]))
+            .unwrap();
+        manager
+            .runtime
+            .block_on(manager.start("ui-fixture"))
+            .unwrap();
+        manager.runtime.block_on(async {
+            tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                while manager.snapshot("ui-fixture").local_endpoint.is_none() {
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .unwrap();
+        });
+        let app = adw::Application::builder()
+            .application_id("io.github._6E6B.marshal.CloudflareUITest")
+            .flags(gio::ApplicationFlags::NON_UNIQUE)
+            .build();
+        app.register(None::<&gio::Cancellable>).unwrap();
+        let ui = build(&app, manager, true);
+        settle();
+        ui.selected.replace(Some("ui-fixture".into()));
+        ui.remote();
+        settle();
+        let provider = descendants(&ui.navigation.visible_page().unwrap())
+            .iter()
+            .find_map(|w| w.clone().downcast::<adw::ComboRow>().ok())
+            .unwrap();
+        check_cloudflare_setup(&ui, &provider);
+        ui.manager
+            .runtime
+            .block_on(ui.manager.stop("ui-fixture"))
+            .unwrap();
+        ui.window.destroy();
+        settle();
+    }
+
+    fn check_cloudflare_setup(ui: &Rc<Ui>, provider: &adw::ComboRow) {
+        provider.set_selected(5);
+        settle();
+        let setup = ui.window.visible_dialog().unwrap();
+        assert_eq!(setup.title(), "Set Up Cloudflare Tunnel");
+        snapshot(ui, "cloudflare-setup");
+        let fields = descendants(&setup);
+        let credential = fields
+            .iter()
+            .find_map(|w| w.clone().downcast::<adw::PasswordEntryRow>().ok())
+            .unwrap();
+        assert_eq!(credential.title(), "Tunnel Token");
+        assert!(credential.text().is_empty());
+        let hostname = fields
+            .iter()
+            .find_map(|w| w.clone().downcast::<adw::EntryRow>().ok())
+            .unwrap();
+        assert_eq!(hostname.title(), "Public Hostname");
+        assert!(
+            fields.iter().any(
+                |w| w
+                    .clone()
+                    .downcast::<adw::ActionRow>()
+                    .is_ok_and(|row| row.title() == "Cloudflare HTTP Service"
+                        && row
+                            .subtitle()
+                            .is_some_and(|origin| origin.starts_with("http://127.0.0.1:")))
+            )
+        );
+        let save = fields
+            .iter()
+            .find_map(|w| {
+                w.clone()
+                    .downcast::<gtk::Button>()
+                    .ok()
+                    .filter(|button| button.label().as_deref() == Some("Save"))
+            })
+            .unwrap();
+        hostname.set_text("http://invalid.example.com/private");
+        save.emit_clicked();
+        assert!(
+            ui.manager
+                .server("ui-fixture")
+                .unwrap()
+                .remote
+                .provider
+                .is_empty()
+        );
+        setup.close();
+        settle();
+        assert_eq!(
+            provider.selected(),
+            0,
+            "Cancel must restore the saved provider"
+        );
+    }
+
+    #[test]
     #[ignore = "Requires a graphical desktop; opens a temporary test window"]
     fn native_window_adapts_and_dialogs_render() {
         adw::init().unwrap();
@@ -4113,6 +4311,7 @@ mod tests {
         setup.close();
         settle();
         assert_eq!(provider.selected(), 0);
+        check_cloudflare_setup(&ui, &provider);
         ui.manager.update("ui-fixture", |s| {
             s.remote_state = "Failed: Test tunnel failure".into()
         });
