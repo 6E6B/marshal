@@ -1067,7 +1067,9 @@ impl Manager {
     }
 
     pub async fn bridge(self: &Arc<Self>, id: &str, cancel: CancellationToken) -> Result<String> {
-        let path = format!("/{}/mcp", uuid::Uuid::new_v4());
+        // Server IDs are persisted in the registry. Keep the public path stable
+        // across tunnel reconnects and application restarts, like the local bridge.
+        let path = format!("/{id}/mcp");
         self.bridge_with_port(id, None, &path, cancel).await
     }
 
@@ -1652,6 +1654,15 @@ mod tests {
 
             let cancellation = CancellationToken::new();
             let endpoint = m.bridge(&server.id, cancellation.clone()).await.unwrap();
+            let expected_path = format!("/{}/mcp", server.id);
+            assert_eq!(reqwest::Url::parse(&endpoint).unwrap().path(), expected_path);
+            let reconnect_cancel = CancellationToken::new();
+            let reconnect = m
+                .bridge(&server.id, reconnect_cancel.clone())
+                .await
+                .unwrap();
+            assert_eq!(reqwest::Url::parse(&reconnect).unwrap().path(), expected_path);
+            reconnect_cancel.cancel();
             let http = reqwest::Client::new();
             let discovery = json!({
                 "jsonrpc": "2.0",
@@ -1751,6 +1762,19 @@ mod tests {
             m.restart(&server.id).await.unwrap();
             ready(&m, &server.id).await;
             assert_ne!(m.snapshot(&server.id).pid, Some(pid));
+            let restart_cancel = CancellationToken::new();
+            let persisted_id = m.registry.load().unwrap()[0].id.clone();
+            let restarted = m
+                .bridge(&persisted_id, restart_cancel.clone())
+                .await
+                .unwrap();
+            assert_eq!(reqwest::Url::parse(&restarted).unwrap().path(), expected_path);
+            let client = ()
+                .serve(StreamableHttpClientTransport::from_uri(restarted))
+                .await
+                .unwrap();
+            client.cancel().await.unwrap();
+            restart_cancel.cancel();
             m.stop(&server.id).await.unwrap();
             assert_eq!(m.snapshot(&server.id).state, "Stopped");
             assert!(
