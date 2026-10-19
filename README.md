@@ -27,6 +27,12 @@ The computer must have GTK 4.16 or a subsequent version, and libadwaita 1.7 or a
 cargo run
 ```
 
+## Stable remote connection paths
+
+All remote providers use the saved server ID for the MCP path (`/<server-id>/mcp`), so restarting a tunnel, server, or Marshal keeps that path unchanged. Existing remote connections need their URL updated once after upgrading from a version that generated a fresh UUID for each tunnel start. Deleting and recreating a server gives it a new ID.
+
+The public hostname is controlled by the tunnel provider. For ngrok, set **Public Domain (Optional)** in the provider settings to the assigned development domain or a domain configured in your ngrok account. Cloudflare Named Tunnel uses its configured hostname. Cloudflare Quick Tunnel still assigns a new hostname on each start.
+
 ## Cloudflare remote access
 
 Install [`cloudflared`](https://developers.cloudflare.com/cloudflare-one/networks/connectors/cloudflare-tunnel/downloads/) on the host and make it available on `PATH`. The same requirement applies to Flatpak installations: Marshal starts the host's tunnel client, rather than installing one inside the sandbox.
