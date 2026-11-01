@@ -11,6 +11,13 @@ use std::{cell::RefCell, collections::HashMap, rc::Rc, sync::Arc, time::Instant}
 
 mod streams;
 
+/// Shared slot holding a callback that re-renders a list; filled after creation
+/// so the callback can reference itself through the slot.
+type RefreshSlot = Rc<RefCell<Option<Rc<dyn Fn()>>>>;
+
+/// (literal headers, secret header names) edited by `headers_editor`.
+type HeadersState = Rc<RefCell<(std::collections::BTreeMap<String, String>, Vec<String>)>>;
+
 struct CommandRow {
     id: String,
     row: adw::ActionRow,
@@ -3027,7 +3034,7 @@ impl Ui {
 
         let profile_rows: Rc<RefCell<Vec<adw::ActionRow>>> = Rc::new(RefCell::new(vec![]));
         // Delete/edit handlers re-render the group through this shared cell.
-        let refresh_slot: Rc<RefCell<Option<Rc<dyn Fn()>>>> = Rc::new(RefCell::new(None));
+        let refresh_slot: RefreshSlot = Rc::new(RefCell::new(None));
         *refresh_slot.borrow_mut() = Some({
             let ui = self.clone();
             let profiles_group = profiles_group.clone();
@@ -3774,7 +3781,7 @@ fn environment_editor(
 /// header names); secret values are stored in the keyring as `header:{name}`.
 fn headers_editor(
     parent: &adw::PreferencesDialog,
-    state: Rc<RefCell<(std::collections::BTreeMap<String, String>, Vec<String>)>>,
+    state: HeadersState,
     changes: Rc<RefCell<Vec<(String, String)>>>,
     manager: Arc<Manager>,
     server_id: String,

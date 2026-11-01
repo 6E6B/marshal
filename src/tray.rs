@@ -360,8 +360,7 @@ mod tests {
                 "Pixmap {name} has wrong byte length"
             );
             let mut non_zero = 0;
-            for chunk in data.chunks_exact(4) {
-                let (a, r, g, b) = (chunk[0], chunk[1], chunk[2], chunk[3]);
+            for &[a, r, g, b] in data.as_chunks::<4>().0 {
                 if a > 0 {
                     non_zero += 1;
                     // In ARGB network byte order, premultiplied white has R==A, G==A, B==A

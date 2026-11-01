@@ -5,7 +5,7 @@
   <summary>Manage MCP servers</summary>
   <metadata_license>CC0-1.0</metadata_license>
   <project_license>GPL-3.0-or-later</project_license>
-  <developer id="io.github._6E6B">
+  <developer id="io.github._6e6b">
     <name>Marshal Contributors</name>
   </developer>
   <launchable type="desktop-id">io.github._6E6B.marshal.desktop</launchable>
