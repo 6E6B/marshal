@@ -74,8 +74,8 @@ pub fn manage_clients_dialog(
     let mode_row = adw::ComboRow::builder()
         .title("Harness Connection")
         .model(&gtk::StringList::new(&[
-            "Local Bridge (HTTP) — shared server instance",
-            "Direct Launch (Stdio) — independent process",
+            "Local Bridge (HTTP) - shared server instance",
+            "Direct Launch (Stdio) - independent process",
         ]))
         .selected(if has_bridge { 0 } else { 1 })
         .build();

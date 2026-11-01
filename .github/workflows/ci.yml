@@ -1,0 +1,97 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  rustfmt:
+    name: Rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all --check
+
+  # GTK >= 4.16 and libadwaita >= 1.7 are newer than Ubuntu's runner images
+  # ship, so build and test inside a Fedora container instead.
+  check:
+    name: Clippy & tests
+    runs-on: ubuntu-latest
+    container: registry.fedoraproject.org/fedora:44
+    steps:
+      - name: Install system dependencies
+        run: >-
+          dnf install -y --setopt=install_weak_deps=False
+          gcc git tar zstd gtk4-devel libadwaita-devel python3
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
+      - name: Tests
+        run: cargo test --locked
+
+  metadata:
+    name: Desktop & AppStream metadata
+    runs-on: ubuntu-latest
+    container: registry.fedoraproject.org/fedora:44
+    steps:
+      - name: Install validators
+        run: >-
+          dnf install -y --setopt=install_weak_deps=False
+          appstream desktop-file-utils python3
+      - uses: actions/checkout@v7
+      - name: Validate desktop entry
+        run: desktop-file-validate data/io.github._6E6B.marshal.desktop
+      - name: Validate AppStream metainfo
+        run: appstreamcli validate --no-net data/io.github._6E6B.marshal.metainfo.xml
+      - name: Check flatpak/cargo-sources.json matches Cargo.lock
+        shell: python3 {0}
+        run: |
+          import json, sys, tomllib
+          with open("Cargo.lock", "rb") as f:
+              lock = tomllib.load(f)
+          want = {f"{p['name']}-{p['version']}" for p in lock["package"] if "source" in p}
+          with open("flatpak/cargo-sources.json") as f:
+              sources = json.load(f)
+          have = {
+              s["dest"].rsplit("/", 1)[-1]
+              for s in sources
+              if s.get("dest", "").startswith("cargo/vendor/")
+          }
+          missing = sorted(want - have)
+          if missing:
+              print("cargo-sources.json is out of date; run flatpak/update-cargo-sources.sh")
+              print("Missing crates:", *missing, sep="\n  ")
+              sys.exit(1)
+
+  flatpak:
+    name: Flatpak
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/flathub-infra/flatpak-github-actions:gnome-50
+      options: --privileged
+    steps:
+      - uses: actions/checkout@v7
+      - uses: flathub-infra/flatpak-github-actions/flatpak-builder@master
+        with:
+          bundle: marshal.flatpak
+          manifest-path: flatpak/io.github._6E6B.marshal.yml
+          cache-key: flatpak-builder-${{ github.sha }}

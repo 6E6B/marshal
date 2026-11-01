@@ -54,6 +54,16 @@ fn endpoint_path(endpoint: &str) -> String {
         .unwrap_or_default()
 }
 
+/// Whether tunnel-client's Prometheus metrics show a recent successful
+/// control-plane poll. Long polls last up to ~35 s, so allow a few cycles.
+fn openai_polling(metrics: &str, now: f64) -> bool {
+    metrics
+        .lines()
+        .filter(|line| line.starts_with("commands_poll_last_successful_timestamp_seconds"))
+        .filter_map(|line| line.rsplit(' ').next()?.parse::<f64>().ok())
+        .any(|last| last > 0.0 && now - last < 120.0)
+}
+
 pub struct OpenAITunnelProvider;
 pub struct NgrokProvider;
 pub struct CloudflareProvider;
@@ -89,8 +99,32 @@ impl TunnelProvider for OpenAITunnelProvider {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Option<String>>> + Send + 'a>>
     {
         Box::pin(async move {
-            let ready = http_probe(http, health, "/readyz").await?.is_some();
-            Ok(ready.then(|| ctx.server.remote.tunnel_id.clone()))
+            // /readyz answers plain text and turns 200 once local startup gates
+            // pass, even when the control plane rejects every poll (bad key or
+            // tunnel ID). Only a recent successful poll means OpenAI can reach us.
+            let ready = http
+                .get(format!("http://{health}/readyz"))
+                .send()
+                .await
+                .context("probe request failed")?
+                .status()
+                .is_success();
+            if !ready {
+                return Ok(None);
+            }
+            let metrics = http
+                .get(format!("http://{health}/metrics"))
+                .send()
+                .await
+                .context("probe request failed")?
+                .text()
+                .await
+                .context("probe request failed")?;
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs_f64())
+                .unwrap_or_default();
+            Ok(openai_polling(&metrics, now).then(|| ctx.server.remote.tunnel_id.clone()))
         })
     }
 }
@@ -456,6 +490,21 @@ pub async fn run(manager: Arc<Manager>, server: &Server, cancel: CancellationTok
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn openai_connected_only_after_recent_successful_poll() {
+        let line = |ts: &str| {
+            format!(
+                "# HELP commands_poll_last_successful_timestamp_seconds x\n\
+                 commands_poll_last_successful_timestamp_seconds{{otel_scope_name=\"controlplane\"}} {ts}\n"
+            )
+        };
+        assert!(!openai_polling(&line("0"), 1_000.0), "never polled");
+        assert!(openai_polling(&line("990.5"), 1_000.0));
+        assert!(openai_polling(&line("1.7e+09"), 1.7e9 + 30.0));
+        assert!(!openai_polling(&line("500"), 1_000.0), "stale poll");
+        assert!(!openai_polling("", 1_000.0));
+    }
+
     #[test]
     fn provider_commands_keep_credentials_out_of_arguments() {
         let mut server: Server = serde_json::from_value(serde_json::json!({

@@ -233,9 +233,9 @@ impl Server {
 /// keep them in the form the user entered and only reject invalid bytes.
 fn validate_header_name(key: &str) -> Result<()> {
     let valid = !key.is_empty()
-        && key.bytes().all(|b| {
-            b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b)
-        });
+        && key
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b));
     if !valid {
         bail!("Invalid header name: {key}");
     }
@@ -409,7 +409,11 @@ pub fn autostart_desktop_path() -> Option<PathBuf> {
 }
 
 pub fn autostart_exec_command(run_in_background: bool) -> String {
-    let bg_flag = if run_in_background { " --background" } else { "" };
+    let bg_flag = if run_in_background {
+        " --background"
+    } else {
+        ""
+    };
     if crate::host::in_flatpak() {
         format!("flatpak run io.github._6E6B.marshal{bg_flag}")
     } else if crate::host::is_command_in_path("marshal") {

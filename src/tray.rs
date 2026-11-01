@@ -1,8 +1,8 @@
+use gtk::glib;
+use ksni::TrayMethods;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use gtk::glib;
-use ksni::TrayMethods;
 
 static ICON_16: &[u8] = include_bytes!("../data/icons/tray-16.bin");
 static ICON_24: &[u8] = include_bytes!("../data/icons/tray-24.bin");
@@ -277,7 +277,9 @@ impl Drop for TrayService {
 }
 
 pub fn prepare_icon_dir() -> PathBuf {
-    let icon_dir = glib::user_cache_dir().join("io.github._6E6B.marshal").join("icons");
+    let icon_dir = glib::user_cache_dir()
+        .join("io.github._6E6B.marshal")
+        .join("icons");
     let scalable_dir = icon_dir.join("hicolor").join("scalable").join("apps");
     let p16_dir = icon_dir.join("hicolor").join("16x16").join("apps");
     let p24_dir = icon_dir.join("hicolor").join("24x24").join("apps");
@@ -352,10 +354,13 @@ mod tests {
             ("24x24", ICON_24, 24usize),
             ("32x32", ICON_32, 32usize),
         ] {
-            assert_eq!(data.len(), size * size * 4, "Pixmap {name} has wrong byte length");
+            assert_eq!(
+                data.len(),
+                size * size * 4,
+                "Pixmap {name} has wrong byte length"
+            );
             let mut non_zero = 0;
-            for chunk in data.chunks_exact(4) {
-                let (a, r, g, b) = (chunk[0], chunk[1], chunk[2], chunk[3]);
+            for &[a, r, g, b] in data.as_chunks::<4>().0 {
                 if a > 0 {
                     non_zero += 1;
                     // In ARGB network byte order, premultiplied white has R==A, G==A, B==A
@@ -380,10 +385,22 @@ mod tests {
         assert!(dir.exists());
         assert!(dir.join("io.github._6E6B.marshal-symbolic.svg").exists());
         assert!(dir.join("io.github._6E6B.marshal-symbolic.png").exists());
-        assert!(dir.join("hicolor/scalable/apps/io.github._6E6B.marshal-symbolic.svg").exists());
-        assert!(dir.join("hicolor/16x16/apps/io.github._6E6B.marshal-symbolic.png").exists());
-        assert!(dir.join("hicolor/24x24/apps/io.github._6E6B.marshal-symbolic.png").exists());
-        assert!(dir.join("hicolor/32x32/apps/io.github._6E6B.marshal-symbolic.png").exists());
+        assert!(
+            dir.join("hicolor/scalable/apps/io.github._6E6B.marshal-symbolic.svg")
+                .exists()
+        );
+        assert!(
+            dir.join("hicolor/16x16/apps/io.github._6E6B.marshal-symbolic.png")
+                .exists()
+        );
+        assert!(
+            dir.join("hicolor/24x24/apps/io.github._6E6B.marshal-symbolic.png")
+                .exists()
+        );
+        assert!(
+            dir.join("hicolor/32x32/apps/io.github._6E6B.marshal-symbolic.png")
+                .exists()
+        );
     }
 
     #[test]
@@ -451,11 +468,14 @@ mod tests {
         // When window is hidden
         let menu = tray.menu();
         assert!(!menu.is_empty());
-        let labels: Vec<String> = menu.iter().filter_map(|item| match item {
-            ksni::MenuItem::Standard(s) => Some(s.label.clone()),
-            ksni::MenuItem::SubMenu(s) => Some(s.label.clone()),
-            _ => None,
-        }).collect();
+        let labels: Vec<String> = menu
+            .iter()
+            .filter_map(|item| match item {
+                ksni::MenuItem::Standard(s) => Some(s.label.clone()),
+                ksni::MenuItem::SubMenu(s) => Some(s.label.clone()),
+                _ => None,
+            })
+            .collect();
 
         assert!(labels.iter().any(|l| l == "Open Marshal"));
         assert!(labels.iter().any(|l| l == "No MCP Servers"));
@@ -471,11 +491,14 @@ mod tests {
         });
 
         let menu = tray.menu();
-        let labels: Vec<String> = menu.iter().filter_map(|item| match item {
-            ksni::MenuItem::Standard(s) => Some(s.label.clone()),
-            ksni::MenuItem::SubMenu(s) => Some(s.label.clone()),
-            _ => None,
-        }).collect();
+        let labels: Vec<String> = menu
+            .iter()
+            .filter_map(|item| match item {
+                ksni::MenuItem::Standard(s) => Some(s.label.clone()),
+                ksni::MenuItem::SubMenu(s) => Some(s.label.clone()),
+                _ => None,
+            })
+            .collect();
 
         assert!(labels.iter().any(|l| l == "Hide Marshal"));
         assert!(labels.iter().any(|l| l == "Servers: 1 running"));

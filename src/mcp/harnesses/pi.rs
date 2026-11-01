@@ -31,7 +31,7 @@ impl HarnessAdapter for Pi {
     }
 
     fn notice(&self) -> Option<String> {
-        Some("Pi — MCP support via pi-mcp-extension".into())
+        Some("Pi - MCP support via pi-mcp-extension".into())
     }
 
     fn fields(&self) -> Fields {

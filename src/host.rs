@@ -445,9 +445,11 @@ mod tests {
         for key in KEYS {
             match std::env::var_os(key) {
                 Some(value) if !value.is_empty() => {
-                    assert!(vars.iter().any(|(copied, copied_value)| {
-                        copied == key && copied_value == &value
-                    }));
+                    assert!(
+                        vars.iter().any(|(copied, copied_value)| {
+                            copied == key && copied_value == &value
+                        })
+                    );
                 }
                 _ => {
                     assert!(vars.iter().all(|(copied, _)| copied != key));

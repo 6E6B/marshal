@@ -32,15 +32,206 @@ pub struct Snapshot {
     pub resources: Vec<Value>,
     pub templates: Vec<Value>,
     pub prompts: Vec<Value>,
-    pub logs: VecDeque<String>,
-    /// JSON-RPC messages proxied through the local bridge.
-    pub traffic: VecDeque<String>,
+    pub logs: VecDeque<Arc<LogEntry>>,
+    /// MCP messages exchanged with the server, newest last.
+    pub traffic: VecDeque<Arc<TrafficEntry>>,
     pub revision: u64,
     pub remote_state: String,
     pub endpoint: Option<String>,
     pub local_endpoint: Option<String>,
     pub needs_restart: bool,
     pub commands: HashMap<String, String>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum LogLevel {
+    Debug,
+    #[default]
+    Info,
+    Warning,
+    Error,
+}
+impl LogLevel {
+    /// Guesses a level from free-form process output. Servers rarely agree
+    /// on a format, so this looks for the common level words near the start
+    /// of the line and for unmistakable failure markers anywhere.
+    pub fn infer(message: &str) -> Self {
+        let lower = message.to_ascii_lowercase();
+        let head: String = lower.chars().take(48).collect();
+        let word = |text: &str, needle: &str| {
+            text.match_indices(needle).any(|(i, _)| {
+                let before = text[..i].chars().next_back();
+                let after = text[i + needle.len()..].chars().next();
+                !before.is_some_and(char::is_alphanumeric)
+                    && !after.is_some_and(char::is_alphanumeric)
+            })
+        };
+        if [
+            "error",
+            "err",
+            "fatal",
+            "critical",
+            "crit",
+            "alert",
+            "emergency",
+            "panic",
+            "panicked",
+        ]
+        .iter()
+        .any(|w| word(&head, w))
+            || [
+                "traceback (most recent call last)",
+                "unhandled exception",
+                "uncaught exception",
+            ]
+            .iter()
+            .any(|w| lower.contains(w))
+        {
+            Self::Error
+        } else if ["warn", "warning", "deprecated", "deprecationwarning"]
+            .iter()
+            .any(|w| word(&head, w))
+        {
+            Self::Warning
+        } else if ["debug", "trace", "dbg"].iter().any(|w| word(&head, w)) {
+            Self::Debug
+        } else {
+            Self::Info
+        }
+    }
+}
+
+/// One line of server, process or Marshal output.
+#[derive(Clone, Debug)]
+pub struct LogEntry {
+    /// Monotonic per-manager sequence, used by views to append incrementally.
+    pub seq: u64,
+    /// Local wall-clock time, "HH:MM:SS".
+    pub time: String,
+    /// Local date, "YYYY-MM-DD"; empty for lines persisted by older versions.
+    pub date: String,
+    pub source: String,
+    pub level: LogLevel,
+    pub message: String,
+}
+impl LogEntry {
+    /// The persisted, human-readable form: "YYYY-MM-DD HH:MM:SS  source  message".
+    pub fn render(&self) -> String {
+        if self.date.is_empty() {
+            format!("{}  {}  {}", self.time, self.source, self.message)
+        } else {
+            format!(
+                "{} {}  {}  {}",
+                self.date, self.time, self.source, self.message
+            )
+        }
+    }
+    /// Parses a persisted line, accepting the older "HH:MM:SS  source  message" form.
+    fn parse(line: &str, seq: u64) -> Option<Self> {
+        let (stamp, rest) = line.split_once("  ")?;
+        let (source, message) = rest.split_once("  ")?;
+        let (date, time) = stamp.split_once(' ').unwrap_or(("", stamp));
+        Some(Self {
+            seq,
+            time: time.to_owned(),
+            date: date.to_owned(),
+            source: source.to_owned(),
+            level: LogLevel::infer(message),
+            message: message.to_owned(),
+        })
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TrafficOutcome {
+    Ok,
+    /// The call succeeded at the protocol level but the tool reported `isError`.
+    ToolError(String),
+    Error(String),
+    Notification,
+}
+
+/// One MCP request or notification and its response.
+#[derive(Clone, Debug)]
+pub struct TrafficEntry {
+    pub seq: u64,
+    /// Local time, "HH:MM:SS.mmm".
+    pub time: String,
+    /// The client that sent it, e.g. "claude-code 2.1" or "Marshal".
+    pub client: String,
+    pub method: String,
+    /// The tool, prompt or resource the method acted on, when there is one.
+    pub target: Option<String>,
+    /// Pretty-printed request parameters.
+    pub params: Option<String>,
+    /// Pretty-printed result.
+    pub response: Option<String>,
+    pub outcome: TrafficOutcome,
+    pub duration_ms: Option<u64>,
+}
+impl TrafficEntry {
+    pub fn failed(&self) -> bool {
+        matches!(
+            self.outcome,
+            TrafficOutcome::Error(_) | TrafficOutcome::ToolError(_)
+        )
+    }
+    /// A one-line explanation of a failure.
+    pub fn failure(&self) -> Option<&str> {
+        match &self.outcome {
+            TrafficOutcome::Error(e) | TrafficOutcome::ToolError(e) => Some(e),
+            _ => None,
+        }
+    }
+    /// The tool name, resource URI or prompt name a method acted on.
+    pub fn target_of(method: &str, params: &Value) -> Option<String> {
+        let key = match method {
+            "tools/call" | "prompts/get" => "name",
+            "resources/read" | "resources/subscribe" | "resources/unsubscribe" => "uri",
+            "completion/complete" => {
+                return params["ref"]["name"]
+                    .as_str()
+                    .or(params["ref"]["uri"].as_str())
+                    .map(str::to_owned);
+            }
+            _ => return None,
+        };
+        params[key].as_str().map(str::to_owned)
+    }
+}
+
+/// Pretty-prints JSON for the inspectors, truncated to keep memory bounded.
+fn pretty_capped(value: &Value) -> String {
+    const LIMIT: usize = 32 * 1024;
+    let text = serde_json::to_string_pretty(value).unwrap_or_default();
+    if text.len() <= LIMIT {
+        return text;
+    }
+    let mut end = LIMIT;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!(
+        "{}\n… truncated ({} KiB total)",
+        &text[..end],
+        text.len() / 1024
+    )
+}
+
+fn local_now() -> (String, String) {
+    gtk::glib::DateTime::now_local()
+        .ok()
+        .and_then(|now| {
+            Some((
+                now.format("%Y-%m-%d").ok()?.to_string(),
+                format!(
+                    "{}.{:03}",
+                    now.format("%H:%M:%S").ok()?,
+                    now.microsecond() / 1000
+                ),
+            ))
+        })
+        .unwrap_or_default()
 }
 
 /// A server-initiated elicitation waiting for the user interface to collect
@@ -96,6 +287,7 @@ pub struct Manager {
     command_jobs: Mutex<HashMap<(String, String), Job>>,
     operations: tokio::sync::Mutex<()>,
     elicitations: Mutex<VecDeque<PendingElicitation>>,
+    sequence: std::sync::atomic::AtomicU64,
     pub load_error: Option<String>,
 }
 impl Manager {
@@ -138,6 +330,7 @@ impl Manager {
             command_jobs: Mutex::new(HashMap::new()),
             operations: tokio::sync::Mutex::new(()),
             elicitations: Mutex::new(VecDeque::new()),
+            sequence: std::sync::atomic::AtomicU64::new(1),
             load_error: error,
         });
         manager.seed_logs();
@@ -151,14 +344,19 @@ impl Manager {
             let Ok(raw) = std::fs::read_to_string(&path) else {
                 continue;
             };
-            let lines: Vec<String> = raw.lines().map(str::to_owned).collect();
-            let start = lines.len().saturating_sub(200);
-            self.update(&server.id, |s| {
-                for line in &lines[start..] {
-                    s.logs.push_back(line.clone());
-                }
-            });
+            let lines: Vec<&str> = raw.lines().collect();
+            let start = lines.len().saturating_sub(500);
+            let entries: Vec<_> = lines[start..]
+                .iter()
+                .filter_map(|line| LogEntry::parse(line, self.next_seq()))
+                .map(Arc::new)
+                .collect();
+            self.update(&server.id, |s| s.logs.extend(entries));
         }
+    }
+    fn next_seq(&self) -> u64 {
+        self.sequence
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     }
     pub fn settings(&self) -> AppSettings {
         self.settings.lock().unwrap().clone()
@@ -200,6 +398,23 @@ impl Manager {
                 ..Default::default()
             })
     }
+    /// Clones one stream (logs or traffic) of a server's snapshot, or returns
+    /// `None` when nothing has changed since revision `seen`. Much cheaper than
+    /// `snapshot`, which deep-clones tools, resources and prompts too.
+    pub fn stream<T: Clone>(
+        &self,
+        id: &str,
+        seen: Option<u64>,
+        pick: impl FnOnce(&Snapshot) -> &VecDeque<T>,
+    ) -> Option<(u64, VecDeque<T>)> {
+        let states = self.snapshots.lock().unwrap();
+        let state = states.get(id);
+        let revision = state.map_or(0, |s| s.revision);
+        if seen == Some(revision) {
+            return None;
+        }
+        Some((revision, state.map(|s| pick(s).clone()).unwrap_or_default()))
+    }
     pub(crate) fn update(&self, id: &str, f: impl FnOnce(&mut Snapshot)) {
         let mut states = self.snapshots.lock().unwrap();
         let state = states.entry(id.into()).or_insert_with(|| Snapshot {
@@ -211,40 +426,91 @@ impl Manager {
         state.revision += 1;
     }
     pub(crate) fn log(&self, id: &str, source: &str, message: &str) {
-        let stamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs()
-            % 86400;
-        let lines: Vec<String> = message
+        self.log_at(id, source, None, message);
+    }
+    /// Records output with an explicit level, or one inferred per line.
+    pub(crate) fn log_at(&self, id: &str, source: &str, level: Option<LogLevel>, message: &str) {
+        let (date, time) = local_now();
+        let time = time.split('.').next().unwrap_or_default().to_owned();
+        let entries: Vec<Arc<LogEntry>> = message
             .lines()
+            .filter(|line| !line.trim().is_empty())
             .take(32)
             .map(|line| {
-                format!(
-                    "{:02}:{:02}:{:02}  {source}  {}",
-                    stamp / 3600,
-                    stamp / 60 % 60,
-                    stamp % 60,
-                    line.chars().take(4096).collect::<String>()
-                )
+                let message = line.trim_end().chars().take(4096).collect::<String>();
+                Arc::new(LogEntry {
+                    seq: self.next_seq(),
+                    time: time.clone(),
+                    date: date.clone(),
+                    source: source.to_owned(),
+                    level: level.unwrap_or_else(|| LogLevel::infer(&message)),
+                    message,
+                })
             })
             .collect();
+        if entries.is_empty() {
+            return;
+        }
+        let lines: Vec<String> = entries.iter().map(|e| e.render()).collect();
         self.update(id, |s| {
-            for line in &lines {
-                s.logs.push_back(line.clone());
-            }
-            while s.logs.len() > 1000 {
+            s.logs.extend(entries);
+            while s.logs.len() > 2000 {
                 s.logs.pop_front();
             }
         });
         persist_log_lines(id, &lines);
     }
+    /// Forgets in-memory logs and empties the persisted log file.
+    pub fn clear_logs(&self, id: &str) {
+        self.update(id, |s| s.logs.clear());
+        let _ = std::fs::write(crate::config::logs_dir().join(format!("{id}.log")), "");
+    }
+    pub fn clear_traffic(&self, id: &str) {
+        self.update(id, |s| s.traffic.clear());
+    }
+    pub fn log_path(&self, id: &str) -> std::path::PathBuf {
+        crate::config::logs_dir().join(format!("{id}.log"))
+    }
 
-    /// Records one bridge-proxied JSON-RPC exchange for the traffic inspector.
-    pub(crate) fn traffic(&self, id: &str, entry: String) {
+    /// Records one MCP exchange for the traffic inspector.
+    pub(crate) fn record_traffic(
+        &self,
+        id: &str,
+        client: &str,
+        method: &str,
+        params: &Value,
+        result: Option<Result<&Value, String>>,
+        elapsed: Option<Duration>,
+    ) {
+        let (_, time) = local_now();
+        let outcome = match &result {
+            None => TrafficOutcome::Notification,
+            Some(Err(e)) => TrafficOutcome::Error(e.clone()),
+            Some(Ok(v)) if v["isError"].as_bool() == Some(true) => TrafficOutcome::ToolError(
+                v["content"]
+                    .as_array()
+                    .and_then(|c| c.iter().find_map(|c| c["text"].as_str()))
+                    .map(|t| t.lines().next().unwrap_or("").chars().take(300).collect())
+                    .filter(|t: &String| !t.is_empty())
+                    .unwrap_or_else(|| "The tool reported an error".into()),
+            ),
+            Some(Ok(_)) => TrafficOutcome::Ok,
+        };
+        let empty = params.is_null() || params.as_object().is_some_and(|o| o.is_empty());
+        let entry = Arc::new(TrafficEntry {
+            seq: self.next_seq(),
+            time,
+            client: client.to_owned(),
+            method: method.to_owned(),
+            target: TrafficEntry::target_of(method, params),
+            params: (!empty).then(|| pretty_capped(params)),
+            response: result.and_then(|r| r.ok()).map(pretty_capped),
+            outcome,
+            duration_ms: elapsed.map(|d| d.as_millis() as u64),
+        });
         self.update(id, |s| {
-            s.traffic.push_back(entry.chars().take(1024).collect());
-            while s.traffic.len() > 300 {
+            s.traffic.push_back(entry);
+            while s.traffic.len() > 500 {
                 s.traffic.pop_front();
             }
         });
@@ -360,10 +626,12 @@ impl Manager {
                     .collect();
                 if let (
                     Connection::Http {
-                        secret_headers: old, ..
+                        secret_headers: old,
+                        ..
                     },
                     Connection::Http {
-                        secret_headers: new, ..
+                        secret_headers: new,
+                        ..
                     },
                 ) = (&s.connection, &server.connection)
                 {
@@ -413,10 +681,7 @@ impl Manager {
         self.registry.save(&definitions)?;
         *self.definitions.lock().unwrap() = definitions;
         let mut keys: Vec<String> = server.secrets.clone();
-        if let Connection::Http {
-            secret_headers, ..
-        } = &server.connection
-        {
+        if let Connection::Http { secret_headers, .. } = &server.connection {
             keys.extend(
                 secret_headers
                     .iter()
@@ -620,7 +885,7 @@ impl Manager {
                     .err()
                     .map(|e| format!("{e:#}"))
                     .unwrap_or_else(|| "The MCP connection closed".into());
-                manager.log(&server.id, "MCP", &message);
+                manager.log_at(&server.id, "MCP", Some(LogLevel::Error), &message);
                 manager.update(&server.id, |s| {
                     s.state = "Failed".into();
                     s.error = Some(message);
@@ -841,7 +1106,7 @@ impl Manager {
                             manager.log(
                                 &bridge_id,
                                 "Bridge",
-                                &format!("Could not start local bridge: {e:#}"),
+                                &format!("Error: could not start local bridge: {e:#}"),
                             );
                         }
                     }
@@ -859,7 +1124,7 @@ impl Manager {
                 }
                 let discovery = tokio::select! { _ = cancel.cancelled() => Ok(()), result = self.discover(id) => result };
                 if let Err(e) = discovery {
-                    self.log(id, "Discovery", &e.to_string());
+                    self.log_at(id, "Discovery", Some(LogLevel::Error), &e.to_string());
                     self.update(id, |s| s.error = Some(format!("Discovery incomplete: {e}")));
                 }
                 let token = session.cancellation_token();
@@ -908,10 +1173,22 @@ impl Manager {
             .ok_or_else(|| anyhow!("Start the server to use this feature"))?;
         let request: ClientRequest =
             serde_json::from_value(json!({"method": method, "params": params}))?;
-        let result = tokio::time::timeout(Duration::from_secs(60), peer.send_request(request))
-            .await
-            .context("MCP request timed out")??;
-        Ok(serde_json::to_value(result)?)
+        let started = Instant::now();
+        let result: Result<Value> =
+            match tokio::time::timeout(Duration::from_secs(60), peer.send_request(request)).await {
+                Err(_) => Err(anyhow!("MCP request timed out")),
+                Ok(Err(e)) => Err(e.into()),
+                Ok(Ok(result)) => serde_json::to_value(result).map_err(Into::into),
+            };
+        self.record_traffic(
+            id,
+            "Marshal",
+            method,
+            &params,
+            Some(result.as_ref().map_err(|e| format!("{e:#}"))),
+            Some(started.elapsed()),
+        );
+        result
     }
     pub async fn discover(&self, id: &str) -> Result<()> {
         let snapshot = self.snapshot(id);
@@ -1207,7 +1484,11 @@ fn persist_log_lines(id: &str, lines: &[String]) {
             .unwrap_or(0);
         let _ = std::fs::write(&path, &tail[start..]);
     }
-    if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
         for line in lines {
             let _ = writeln!(file, "{line}");
         }
@@ -1336,7 +1617,8 @@ impl rmcp::ClientHandler for ClientService {
     ) -> Result<CreateElicitationResult, rmcp::ErrorData> {
         let message = params.message.clone();
         let rx = self.manager.elicitation_wait(&self.id, params);
-        self.manager.log(&self.id, "Server", &format!("Requests input: {message}"));
+        self.manager
+            .log(&self.id, "Server", &format!("Requests input: {message}"));
         match tokio::time::timeout(Duration::from_secs(300), rx).await {
             Ok(Ok(result)) => Ok(result),
             Ok(Err(_)) | Err(_) => Ok(CreateElicitationResult {
@@ -1355,11 +1637,14 @@ impl rmcp::ClientHandler for ClientService {
             .as_str()
             .map(str::to_owned)
             .unwrap_or_else(|| params.data.to_string());
-        self.manager.log(
-            &self.id,
-            "Server",
-            &format!("{:?}: {}", params.level, text),
-        );
+        let level = match params.level {
+            LoggingLevel::Debug => LogLevel::Debug,
+            LoggingLevel::Info | LoggingLevel::Notice => LogLevel::Info,
+            LoggingLevel::Warning => LogLevel::Warning,
+            _ => LogLevel::Error,
+        };
+        let source = params.logger.as_deref().unwrap_or("Server");
+        self.manager.log_at(&self.id, source, Some(level), &text);
     }
     async fn on_tool_list_changed(&self, _context: NotificationContext<RoleClient>) {
         let manager = self.manager.clone();
@@ -1384,6 +1669,22 @@ impl rmcp::ClientHandler for ClientService {
     }
 }
 
+fn client_label(info: Option<&InitializeRequestParam>) -> String {
+    info.map(|i| {
+        let name = i
+            .client_info
+            .title
+            .as_deref()
+            .unwrap_or(&i.client_info.name);
+        if i.client_info.version.is_empty() {
+            name.to_owned()
+        } else {
+            format!("{name} {}", i.client_info.version)
+        }
+    })
+    .unwrap_or_else(|| "Unknown Client".into())
+}
+
 #[derive(Clone)]
 struct Bridge {
     peer: Peer<RoleClient>,
@@ -1400,43 +1701,48 @@ impl Service<RoleServer> for Bridge {
             context.peer.set_peer_info(request.params);
             return Ok(ServerResult::InitializeResult(self.get_info()));
         }
-        let description = serde_json::to_value(&request)
-            .ok()
-            .and_then(|v| {
-                let method = v["method"].as_str()?.to_owned();
-                let params = v["params"].to_string();
-                Some(format!(
-                    "{method} {}",
-                    params.chars().take(120).collect::<String>()
-                ))
-            })
-            .unwrap_or_else(|| "request".into());
+        let raw = serde_json::to_value(&request).unwrap_or_default();
+        let method = raw["method"].as_str().unwrap_or("request").to_owned();
+        let params = raw["params"].clone();
+        let client = client_label(context.peer.peer_info());
         let started = Instant::now();
         let result =
-            tokio::time::timeout(Duration::from_secs(60), self.peer.send_request(request))
+            match tokio::time::timeout(Duration::from_secs(60), self.peer.send_request(request))
                 .await
-                .map_err(|_| rmcp::ErrorData::internal_error("Upstream timed out", None))?
-                .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None));
-        self.manager.traffic(
+            {
+                Err(_) => Err(rmcp::ErrorData::internal_error("Upstream timed out", None)),
+                Ok(result) => {
+                    result.map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None))
+                }
+            };
+        let value = result
+            .as_ref()
+            .ok()
+            .and_then(|r| serde_json::to_value(r).ok());
+        self.manager.record_traffic(
             &self.id,
-            format!(
-                "{description} → {} · {}ms",
-                if result.is_ok() { "OK" } else { "error" },
-                started.elapsed().as_millis()
-            ),
+            &client,
+            &method,
+            &params,
+            Some(match (&result, &value) {
+                (Err(e), _) => Err(e.message.to_string()),
+                (Ok(_), Some(v)) => Ok(v),
+                (Ok(_), None) => Ok(&Value::Null),
+            }),
+            Some(started.elapsed()),
         );
         result
     }
     async fn handle_notification(
         &self,
         notification: ClientNotification,
-        _context: NotificationContext<RoleServer>,
+        context: NotificationContext<RoleServer>,
     ) -> Result<(), rmcp::ErrorData> {
-        let method = serde_json::to_value(&notification)
-            .ok()
-            .and_then(|v| v["method"].as_str().map(str::to_owned))
-            .unwrap_or_else(|| "notification".into());
-        self.manager.traffic(&self.id, format!("{method} → notified"));
+        let raw = serde_json::to_value(&notification).unwrap_or_default();
+        let method = raw["method"].as_str().unwrap_or("notification");
+        let client = client_label(context.peer.peer_info());
+        self.manager
+            .record_traffic(&self.id, &client, method, &raw["params"], None, None);
         Ok(())
     }
     fn get_info(&self) -> ServerInfo {
@@ -1489,6 +1795,7 @@ mod tests {
             command_jobs: Mutex::new(HashMap::new()),
             operations: tokio::sync::Mutex::new(()),
             elicitations: Mutex::new(VecDeque::new()),
+            sequence: std::sync::atomic::AtomicU64::new(1),
             load_error: None,
         });
         let server = Server {
@@ -1577,6 +1884,7 @@ mod tests {
                 .snapshot(&server.id)
                 .logs
                 .into_iter()
+                .map(|l| l.render())
                 .collect::<Vec<_>>()
                 .join("\n");
             assert!(logs.contains("inherited"));
@@ -1592,7 +1900,7 @@ mod tests {
                         .snapshot(&server.id)
                         .logs
                         .iter()
-                        .any(|l| l.contains("ready"))
+                        .any(|l| l.message.contains("ready"))
                 {
                     tokio::time::sleep(Duration::from_millis(10)).await;
                 }
@@ -1655,13 +1963,19 @@ mod tests {
             let cancellation = CancellationToken::new();
             let endpoint = m.bridge(&server.id, cancellation.clone()).await.unwrap();
             let expected_path = format!("/{}/mcp", server.id);
-            assert_eq!(reqwest::Url::parse(&endpoint).unwrap().path(), expected_path);
+            assert_eq!(
+                reqwest::Url::parse(&endpoint).unwrap().path(),
+                expected_path
+            );
             let reconnect_cancel = CancellationToken::new();
             let reconnect = m
                 .bridge(&server.id, reconnect_cancel.clone())
                 .await
                 .unwrap();
-            assert_eq!(reqwest::Url::parse(&reconnect).unwrap().path(), expected_path);
+            assert_eq!(
+                reqwest::Url::parse(&reconnect).unwrap().path(),
+                expected_path
+            );
             reconnect_cancel.cancel();
             let http = reqwest::Client::new();
             let discovery = json!({
@@ -1768,11 +2082,14 @@ mod tests {
                 .bridge(&persisted_id, restart_cancel.clone())
                 .await
                 .unwrap();
-            assert_eq!(reqwest::Url::parse(&restarted).unwrap().path(), expected_path);
-            let client = ()
-                .serve(StreamableHttpClientTransport::from_uri(restarted))
-                .await
-                .unwrap();
+            assert_eq!(
+                reqwest::Url::parse(&restarted).unwrap().path(),
+                expected_path
+            );
+            let client =
+                ().serve(StreamableHttpClientTransport::from_uri(restarted))
+                    .await
+                    .unwrap();
             client.cancel().await.unwrap();
             restart_cancel.cancel();
             m.stop(&server.id).await.unwrap();

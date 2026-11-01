@@ -57,9 +57,7 @@ fn to_managed(name: &str, body: &Value) -> Result<Server> {
             let Some(key) = header["name"].as_str() else {
                 continue;
             };
-            if header["isSecret"].as_bool().unwrap_or(false)
-                || header["value"].as_str().is_none()
-            {
+            if header["isSecret"].as_bool().unwrap_or(false) || header["value"].as_str().is_none() {
                 secret_headers.push(key.to_string());
             } else {
                 headers.insert(
@@ -337,7 +335,8 @@ pub fn browse_dialog(
                 .timeout(std::time::Duration::from_secs(15))
                 .build()
                 .unwrap_or_default();
-            let task = runtime.spawn(async move { fetch_page(&http, cursor_value.as_deref()).await });
+            let task =
+                runtime.spawn(async move { fetch_page(&http, cursor_value.as_deref()).await });
             let entries = entries.clone();
             let cursor = cursor.clone();
             let stack = stack.clone();
@@ -414,7 +413,9 @@ mod tests {
         });
         let server = to_managed("io.github.acme/weather", &http).unwrap();
         let Connection::Http {
-            url, secret_headers, ..
+            url,
+            secret_headers,
+            ..
         } = &server.connection
         else {
             panic!()

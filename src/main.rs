@@ -27,7 +27,10 @@ fn cli_list(manager: &backend::Manager) -> String {
             config::Connection::Stdio { executable, .. } => executable.clone(),
             config::Connection::Http { url, .. } => url.clone(),
         };
-        out.push_str(&format!("{}\t{}\t{}\n", server.name, snap.state, connection));
+        out.push_str(&format!(
+            "{}\t{}\t{}\n",
+            server.name, snap.state, connection
+        ));
     }
     if out.is_empty() {
         out.push_str("No servers configured\n");
@@ -51,8 +54,7 @@ fn cli_command(
         glib::ExitCode::FAILURE
     };
     let find = |name: &str| -> Result<config::Server, glib::ExitCode> {
-        resolve_server(manager, name)
-            .ok_or_else(|| fail(format!("No server named “{name}”\n")))
+        resolve_server(manager, name).ok_or_else(|| fail(format!("No server named “{name}”\n")))
     };
     match command {
         "list" | "status" => {
@@ -189,7 +191,8 @@ fn main() -> glib::ExitCode {
                 .filter(|a| !a.starts_with('-'))
                 .map(str::to_owned)
                 .collect();
-            if let Some(code) = cli_command(app, &manager, &positional, cmdline, &ui_holder, &hold) {
+            if let Some(code) = cli_command(app, &manager, &positional, cmdline, &ui_holder, &hold)
+            {
                 return code;
             }
             let has_bg = args
