@@ -360,10 +360,12 @@ impl Manager {
                     .collect();
                 if let (
                     Connection::Http {
-                        secret_headers: old, ..
+                        secret_headers: old,
+                        ..
                     },
                     Connection::Http {
-                        secret_headers: new, ..
+                        secret_headers: new,
+                        ..
                     },
                 ) = (&s.connection, &server.connection)
                 {
@@ -413,10 +415,7 @@ impl Manager {
         self.registry.save(&definitions)?;
         *self.definitions.lock().unwrap() = definitions;
         let mut keys: Vec<String> = server.secrets.clone();
-        if let Connection::Http {
-            secret_headers, ..
-        } = &server.connection
-        {
+        if let Connection::Http { secret_headers, .. } = &server.connection {
             keys.extend(
                 secret_headers
                     .iter()
@@ -1207,7 +1206,11 @@ fn persist_log_lines(id: &str, lines: &[String]) {
             .unwrap_or(0);
         let _ = std::fs::write(&path, &tail[start..]);
     }
-    if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
         for line in lines {
             let _ = writeln!(file, "{line}");
         }
@@ -1336,7 +1339,8 @@ impl rmcp::ClientHandler for ClientService {
     ) -> Result<CreateElicitationResult, rmcp::ErrorData> {
         let message = params.message.clone();
         let rx = self.manager.elicitation_wait(&self.id, params);
-        self.manager.log(&self.id, "Server", &format!("Requests input: {message}"));
+        self.manager
+            .log(&self.id, "Server", &format!("Requests input: {message}"));
         match tokio::time::timeout(Duration::from_secs(300), rx).await {
             Ok(Ok(result)) => Ok(result),
             Ok(Err(_)) | Err(_) => Ok(CreateElicitationResult {
@@ -1355,11 +1359,8 @@ impl rmcp::ClientHandler for ClientService {
             .as_str()
             .map(str::to_owned)
             .unwrap_or_else(|| params.data.to_string());
-        self.manager.log(
-            &self.id,
-            "Server",
-            &format!("{:?}: {}", params.level, text),
-        );
+        self.manager
+            .log(&self.id, "Server", &format!("{:?}: {}", params.level, text));
     }
     async fn on_tool_list_changed(&self, _context: NotificationContext<RoleClient>) {
         let manager = self.manager.clone();
@@ -1412,11 +1413,10 @@ impl Service<RoleServer> for Bridge {
             })
             .unwrap_or_else(|| "request".into());
         let started = Instant::now();
-        let result =
-            tokio::time::timeout(Duration::from_secs(60), self.peer.send_request(request))
-                .await
-                .map_err(|_| rmcp::ErrorData::internal_error("Upstream timed out", None))?
-                .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None));
+        let result = tokio::time::timeout(Duration::from_secs(60), self.peer.send_request(request))
+            .await
+            .map_err(|_| rmcp::ErrorData::internal_error("Upstream timed out", None))?
+            .map_err(|e| rmcp::ErrorData::internal_error(e.to_string(), None));
         self.manager.traffic(
             &self.id,
             format!(
@@ -1436,7 +1436,8 @@ impl Service<RoleServer> for Bridge {
             .ok()
             .and_then(|v| v["method"].as_str().map(str::to_owned))
             .unwrap_or_else(|| "notification".into());
-        self.manager.traffic(&self.id, format!("{method} → notified"));
+        self.manager
+            .traffic(&self.id, format!("{method} → notified"));
         Ok(())
     }
     fn get_info(&self) -> ServerInfo {
@@ -1655,13 +1656,19 @@ mod tests {
             let cancellation = CancellationToken::new();
             let endpoint = m.bridge(&server.id, cancellation.clone()).await.unwrap();
             let expected_path = format!("/{}/mcp", server.id);
-            assert_eq!(reqwest::Url::parse(&endpoint).unwrap().path(), expected_path);
+            assert_eq!(
+                reqwest::Url::parse(&endpoint).unwrap().path(),
+                expected_path
+            );
             let reconnect_cancel = CancellationToken::new();
             let reconnect = m
                 .bridge(&server.id, reconnect_cancel.clone())
                 .await
                 .unwrap();
-            assert_eq!(reqwest::Url::parse(&reconnect).unwrap().path(), expected_path);
+            assert_eq!(
+                reqwest::Url::parse(&reconnect).unwrap().path(),
+                expected_path
+            );
             reconnect_cancel.cancel();
             let http = reqwest::Client::new();
             let discovery = json!({
@@ -1768,11 +1775,14 @@ mod tests {
                 .bridge(&persisted_id, restart_cancel.clone())
                 .await
                 .unwrap();
-            assert_eq!(reqwest::Url::parse(&restarted).unwrap().path(), expected_path);
-            let client = ()
-                .serve(StreamableHttpClientTransport::from_uri(restarted))
-                .await
-                .unwrap();
+            assert_eq!(
+                reqwest::Url::parse(&restarted).unwrap().path(),
+                expected_path
+            );
+            let client =
+                ().serve(StreamableHttpClientTransport::from_uri(restarted))
+                    .await
+                    .unwrap();
             client.cancel().await.unwrap();
             restart_cancel.cancel();
             m.stop(&server.id).await.unwrap();

@@ -52,14 +52,11 @@ pub(crate) struct Ui {
     command_rows: RefCell<Vec<CommandRow>>,
     command_signature: RefCell<String>,
     tray: RefCell<Option<crate::tray::TrayService>>,
-    tray_spawn_rx: RefCell<Option<tokio::sync::oneshot::Receiver<Result<crate::tray::TrayService, String>>>>,
+    tray_spawn_rx:
+        RefCell<Option<tokio::sync::oneshot::Receiver<Result<crate::tray::TrayService, String>>>>,
 }
 
-pub fn build(
-    app: &adw::Application,
-    manager: Arc<Manager>,
-    present_window: bool,
-) -> Rc<Ui> {
+pub fn build(app: &adw::Application, manager: Arc<Manager>, present_window: bool) -> Rc<Ui> {
     let window = adw::ApplicationWindow::builder()
         .application(app)
         .title("Marshal")
@@ -191,10 +188,7 @@ pub fn build(
     let detail_menu = gio::Menu::new();
     let editing = gio::Menu::new();
     editing.append(Some(&t("Configuration")), Some("app.configure"));
-    editing.append(
-        Some(&t("Manage MCP Clients…")),
-        Some("app.manage-clients"),
-    );
+    editing.append(Some(&t("Manage MCP Clients…")), Some("app.manage-clients"));
     editing.append(Some(&t("Duplicate Server")), Some("app.duplicate"));
     detail_menu.append_section(None, &editing);
     let actions = gio::Menu::new();
@@ -335,9 +329,7 @@ pub fn build(
             list.select_row(Some(&row));
             let menu = gtk::PopoverMenu::from_model(Some(&detail_menu));
             menu.set_parent(list);
-            menu.set_pointing_to(Some(&gtk::gdk::Rectangle::new(
-                x as i32, y as i32, 1, 1,
-            )));
+            menu.set_pointing_to(Some(&gtk::gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
             menu.connect_closed(|popover| popover.unparent());
             menu.popup();
             true
@@ -352,9 +344,7 @@ pub fn build(
             }
         });
         list.add_controller(gesture);
-        let long_press = gtk::GestureLongPress::builder()
-            .touch_only(true)
-            .build();
+        let long_press = gtk::GestureLongPress::builder().touch_only(true).build();
         let show = show_menu.clone();
         long_press.connect_pressed(move |gesture, x, y| {
             if show(x, y) {
@@ -981,16 +971,14 @@ impl Ui {
                 manager.clone(),
             )
         });
-        let header_state = Rc::new(RefCell::new(
-            match &server.connection {
-                Connection::Http {
-                    headers,
-                    secret_headers,
-                    ..
-                } => (headers.clone(), secret_headers.clone()),
-                _ => Default::default(),
-            },
-        ));
+        let header_state = Rc::new(RefCell::new(match &server.connection {
+            Connection::Http {
+                headers,
+                secret_headers,
+                ..
+            } => (headers.clone(), secret_headers.clone()),
+            _ => Default::default(),
+        }));
         let parent = dialog.clone();
         let manager = self.manager.clone();
         let header_changes = secret_changes.clone();
@@ -1443,8 +1431,10 @@ impl Ui {
                     .build();
                 let filtered = filtered.clone();
                 let overlay = overlay.clone();
-                picker.save(Some(&window), None::<&gio::Cancellable>, move |result| {
-                    match result {
+                picker.save(
+                    Some(&window),
+                    None::<&gio::Cancellable>,
+                    move |result| match result {
                         Ok(file) => {
                             let text = filtered.borrow().clone();
                             match file.path() {
@@ -1457,18 +1447,17 @@ impl Ui {
                                         "Could not save: {e}"
                                     ))),
                                 },
-                                None => overlay
-                                    .add_toast(adw::Toast::new("Choose a local file")),
+                                None => overlay.add_toast(adw::Toast::new("Choose a local file")),
                             }
                         }
                         Err(error)
                             if error.matches(gtk::DialogError::Dismissed)
                                 || error.matches(gtk::DialogError::Cancelled) => {}
-                        Err(error) => overlay.add_toast(adw::Toast::new(&format!(
-                            "Could not save: {error}"
-                        ))),
-                    }
-                });
+                        Err(error) => {
+                            overlay.add_toast(adw::Toast::new(&format!("Could not save: {error}")))
+                        }
+                    },
+                );
             });
         }
         let rerender = Rc::new(std::cell::Cell::new(false));
@@ -2269,10 +2258,7 @@ impl Ui {
             if previous.as_deref() != Some(&state) {
                 if let Some(error) = state.strip_prefix("Failed: ") {
                     if notify && hidden {
-                        self.notify(
-                            &format!("{}: remote access failed", server.name),
-                            error,
-                        );
+                        self.notify(&format!("{}: remote access failed", server.name), error);
                     }
                     if !hidden {
                         self.error(&format!(
@@ -2315,7 +2301,9 @@ impl Ui {
             if notify
                 && previous.as_deref() != Some(&state)
                 && state == "Failed"
-                && previous.as_deref().is_some_and(|p| p != "Failed" && p != "Stopped")
+                && previous
+                    .as_deref()
+                    .is_some_and(|p| p != "Failed" && p != "Stopped")
             {
                 let error = self
                     .manager
@@ -2503,9 +2491,7 @@ impl Ui {
         let mut diagnostics = vec![];
         if let Some(pid) = s.pid {
             diagnostics.push(format!("PID {pid}"));
-            if let Some((rss, cpu)) =
-                process_stats(&mut self.cpu_samples.borrow_mut(), &id, pid)
-            {
+            if let Some((rss, cpu)) = process_stats(&mut self.cpu_samples.borrow_mut(), &id, pid) {
                 diagnostics.push(format!("Memory {} · CPU {cpu:.1}%", format_kib(rss)));
             }
         } else {
@@ -2711,17 +2697,12 @@ impl Ui {
                         let _ = crate::secrets::SecretStore::set(&copy.id, key, &value).await;
                     }
                 }
-                if let Connection::Http {
-                    secret_headers, ..
-                } = &server.connection
-                {
+                if let Connection::Http { secret_headers, .. } = &server.connection {
                     for header in secret_headers {
                         let name = RemoteConfig::header_secret_name(header);
-                        if let Ok(value) =
-                            crate::secrets::SecretStore::get(&server.id, &name).await
+                        if let Ok(value) = crate::secrets::SecretStore::get(&server.id, &name).await
                         {
-                            let _ =
-                                crate::secrets::SecretStore::set(&copy.id, &name, &value).await;
+                            let _ = crate::secrets::SecretStore::set(&copy.id, &name, &value).await;
                         }
                     }
                 }
@@ -2749,8 +2730,10 @@ impl Ui {
             .initial_name("marshal-servers.json")
             .build();
         let overlay = self.overlay.clone();
-        picker.save(Some(&self.window), None::<&gio::Cancellable>, move |result| {
-            match result {
+        picker.save(
+            Some(&self.window),
+            None::<&gio::Cancellable>,
+            move |result| match result {
                 Ok(file) => match file.path() {
                     Some(path) => {
                         let outcome = serde_json::to_vec_pretty(&servers)
@@ -2762,8 +2745,9 @@ impl Ui {
                                 servers.len(),
                                 if servers.len() == 1 { "" } else { "s" }
                             ))),
-                            Err(e) => overlay
-                                .add_toast(adw::Toast::new(&format!("Export failed: {e:#}"))),
+                            Err(e) => {
+                                overlay.add_toast(adw::Toast::new(&format!("Export failed: {e:#}")))
+                            }
                         }
                     }
                     None => overlay.add_toast(adw::Toast::new("Choose a local file")),
@@ -2771,10 +2755,11 @@ impl Ui {
                 Err(error)
                     if error.matches(gtk::DialogError::Dismissed)
                         || error.matches(gtk::DialogError::Cancelled) => {}
-                Err(error) => overlay
-                    .add_toast(adw::Toast::new(&format!("Could not export: {error}"))),
-            }
-        });
+                Err(error) => {
+                    overlay.add_toast(adw::Toast::new(&format!("Could not export: {error}")))
+                }
+            },
+        );
     }
     fn import_servers(self: &Rc<Self>) {
         let picker = gtk::FileDialog::builder()
@@ -2787,61 +2772,65 @@ impl Ui {
         picker.set_filters(Some(&gio::ListStore::new::<gtk::FileFilter>()));
         picker.set_default_filter(Some(&filter));
         let ui = self.clone();
-        picker.open(Some(&self.window), None::<&gio::Cancellable>, move |result| {
-            let file = match result {
-                Ok(file) => file,
-                Err(error)
-                    if error.matches(gtk::DialogError::Dismissed)
-                        || error.matches(gtk::DialogError::Cancelled) =>
-                {
+        picker.open(
+            Some(&self.window),
+            None::<&gio::Cancellable>,
+            move |result| {
+                let file = match result {
+                    Ok(file) => file,
+                    Err(error)
+                        if error.matches(gtk::DialogError::Dismissed)
+                            || error.matches(gtk::DialogError::Cancelled) =>
+                    {
+                        return;
+                    }
+                    Err(error) => {
+                        ui.error(&format!("Could not open file: {error}"));
+                        return;
+                    }
+                };
+                let Some(path) = file.path() else {
+                    ui.error("Choose a local file");
                     return;
-                }
-                Err(error) => {
-                    ui.error(&format!("Could not open file: {error}"));
-                    return;
-                }
-            };
-            let Some(path) = file.path() else {
-                ui.error("Choose a local file");
-                return;
-            };
-            let manager = ui.manager.clone();
-            let m = manager.clone();
-            let task = manager.runtime.spawn(async move {
-                let raw = std::fs::read(&path)?;
-                let mut imported: Vec<Server> = serde_json::from_slice(&raw)
-                    .context("The file does not contain Marshal servers")?;
-                let mut definitions = m.servers();
-                let mut count = 0usize;
-                for mut server in imported.drain(..) {
-                    server.validate()?;
-                    if definitions.iter().any(|s| s.id == server.id) {
-                        server.id = uuid::Uuid::new_v4().to_string();
+                };
+                let manager = ui.manager.clone();
+                let m = manager.clone();
+                let task = manager.runtime.spawn(async move {
+                    let raw = std::fs::read(&path)?;
+                    let mut imported: Vec<Server> = serde_json::from_slice(&raw)
+                        .context("The file does not contain Marshal servers")?;
+                    let mut definitions = m.servers();
+                    let mut count = 0usize;
+                    for mut server in imported.drain(..) {
+                        server.validate()?;
+                        if definitions.iter().any(|s| s.id == server.id) {
+                            server.id = uuid::Uuid::new_v4().to_string();
+                        }
+                        if definitions.iter().any(|s| s.name == server.name) {
+                            server.name = format!("{} (imported)", server.name);
+                        }
+                        m.save(server.clone(), vec![]).await?;
+                        definitions.push(server);
+                        count += 1;
                     }
-                    if definitions.iter().any(|s| s.name == server.name) {
-                        server.name = format!("{} (imported)", server.name);
+                    Ok::<_, anyhow::Error>(count)
+                });
+                glib::spawn_future_local(async move {
+                    match task.await {
+                        Ok(Ok(count)) => {
+                            ui.refresh_list();
+                            ui.update();
+                            ui.overlay.add_toast(adw::Toast::new(&format!(
+                                "Imported {count} server{}",
+                                if count == 1 { "" } else { "s" }
+                            )));
+                        }
+                        Ok(Err(e)) => ui.error(&format!("Import failed: {e:#}")),
+                        Err(e) => ui.error(&e.to_string()),
                     }
-                    m.save(server.clone(), vec![]).await?;
-                    definitions.push(server);
-                    count += 1;
-                }
-                Ok::<_, anyhow::Error>(count)
-            });
-            glib::spawn_future_local(async move {
-                match task.await {
-                    Ok(Ok(count)) => {
-                        ui.refresh_list();
-                        ui.update();
-                        ui.overlay.add_toast(adw::Toast::new(&format!(
-                            "Imported {count} server{}",
-                            if count == 1 { "" } else { "s" }
-                        )));
-                    }
-                    Ok(Err(e)) => ui.error(&format!("Import failed: {e:#}")),
-                    Err(e) => ui.error(&e.to_string()),
-                }
-            });
-        });
+                });
+            },
+        );
     }
     fn push(&self, title: &str, child: &impl IsA<gtk::Widget>) -> adw::ToolbarView {
         let toolbar = adw::ToolbarView::new();
@@ -2891,7 +2880,9 @@ impl Ui {
                 current.auto_start_login = row.is_active();
                 current.run_in_background_on_startup = bg_startup.is_active();
                 if let Err(e) = ui.manager.save_settings(current) {
-                    dialog.add_toast(adw::Toast::new(&format!("Failed to update autostart: {e:#}")));
+                    dialog.add_toast(adw::Toast::new(&format!(
+                        "Failed to update autostart: {e:#}"
+                    )));
                     row.set_active(ui.manager.settings().auto_start_login);
                 }
             });
@@ -2921,7 +2912,9 @@ impl Ui {
                 current.run_in_background_on_startup = row.is_active();
                 current.auto_start_login = auto_start.is_active();
                 if let Err(e) = ui.manager.save_settings(current) {
-                    dialog.add_toast(adw::Toast::new(&format!("Failed to update startup setting: {e:#}")));
+                    dialog.add_toast(adw::Toast::new(&format!(
+                        "Failed to update startup setting: {e:#}"
+                    )));
                     row.set_active(ui.manager.settings().run_in_background_on_startup);
                 } else {
                     ui.sync_tray();
@@ -3070,11 +3063,7 @@ impl Ui {
         dialog.present(Some(&self.window));
     }
     /// Editor for a named server profile; `done` re-renders the caller's list.
-    fn profile_editor(
-        self: &Rc<Self>,
-        existing: Option<Profile>,
-        done: impl Fn() + 'static,
-    ) {
+    fn profile_editor(self: &Rc<Self>, existing: Option<Profile>, done: impl Fn() + 'static) {
         let editing_name = existing.as_ref().map(|p| p.name.clone());
         let dialog = adw::PreferencesDialog::builder()
             .title(if editing_name.is_some() {
@@ -3199,7 +3188,10 @@ impl Ui {
             } else {
                 "Quitting stops managed servers and remote access."
             };
-            let dialog = adw::AlertDialog::builder().heading("Stop Servers and Quit?").body(body).build();
+            let dialog = adw::AlertDialog::builder()
+                .heading("Stop Servers and Quit?")
+                .body(body)
+                .build();
             dialog.add_responses(&[("cancel", "Cancel"), ("quit", "Stop and Quit")]);
             dialog.set_response_appearance("quit", adw::ResponseAppearance::Destructive);
             dialog.set_default_response(Some("cancel"));
@@ -3710,9 +3702,7 @@ fn headers_editor(
         .content_width(520)
         .build();
     let page = adw::PreferencesPage::new();
-    let ordinary = adw::PreferencesGroup::builder()
-        .title("Headers")
-        .build();
+    let ordinary = adw::PreferencesGroup::builder().title("Headers").build();
     let secret = adw::PreferencesGroup::builder()
         .title("Secret Headers")
         .description("Values are stored in the system keyring.")
@@ -3723,9 +3713,7 @@ fn headers_editor(
         let s = state.clone();
         let key = name.clone();
         row.connect_changed(move |row| {
-            s.borrow_mut()
-                .0
-                .insert(key.clone(), row.text().into());
+            s.borrow_mut().0.insert(key.clone(), row.text().into());
         });
         let remove = gtk::Button::builder()
             .icon_name("edit-delete-symbolic")
@@ -3810,9 +3798,7 @@ fn headers_editor(
     }
     page.add(&ordinary);
     page.add(&secret);
-    let add_group = adw::PreferencesGroup::builder()
-        .title("Add Header")
-        .build();
+    let add_group = adw::PreferencesGroup::builder().title("Add Header").build();
     let name = adw::EntryRow::builder().title("Header Name").build();
     let value = adw::PasswordEntryRow::builder().title("Value").build();
     let sensitive = adw::SwitchRow::builder()
