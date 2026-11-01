@@ -1,62 +1,58 @@
-<div align="center">
-
-<img src="data/io.github._6E6B.marshal.svg" alt="" width="96" height="96">
-
 # Marshal
 
-Run your MCP servers once and share them with every AI agent on your computer.
-
-</div>
-
-Normally every coding agent you use (Claude Code, Codex, Cursor, Zed…) starts its own copy of each MCP server. Marshal runs each server once and lets all your agents connect to it, so you have one place to start and stop servers, try their tools, read their logs and see which agent is calling what.
+Marshal is an MCP server manager for GNOME.
 
 ![Server overview](docs/screenshots/overview.png)
 
-## What you can do
+## Functions
 
-**Manage your servers.** Add local (command-line) or remote (HTTP) MCP servers, start and stop them, and group them into profiles you can launch together. Browse the MCP registry to find new ones. Secrets like API keys are kept in your system keyring.
+- Add local (command) servers and remote (HTTP) servers.
+- Start and stop servers.
+- Start a group of servers with a profile.
+- Find servers in the MCP registry.
+- Keep secrets, for example API keys, in the system keyring.
+- Show the tools of a server. Use a tool with your own inputs.
+- Show each request, the agent that sent it, and its duration.
+- Show the server logs.
+- Add a server to the configuration file of an agent. Marshal does not change other entries in the file.
+- Import servers from the configuration file of an agent.
+- Share a server on the internet through Cloudflare, ngrok, Tailscale Funnel or the OpenAI tunnel.
+- Keep servers in operation from the system tray.
+- Start Marshal when you log in.
 
-**Try tools directly.** See every tool a server offers and run it with your own inputs, without going through an agent.
+## Supported agents
 
-![Tool runner](docs/screenshots/tool-runner.png)
+Claude Code, OpenAI Codex, Cursor, VS Code, Zed, Windsurf, GitHub Copilot CLI, Google Antigravity, OpenCode, Amp, Devin, Kiro, Cline, Roo Code, Continue, Goose and Pi.
 
-**See what your agents are doing.** The Traffic view shows each request, which agent sent it, and how long it took. Server logs are kept in the app too.
-
-![Traffic per client](docs/screenshots/traffic.png)
-
-**Connect your agents in one click.** Marshal finds the agents installed on your computer and adds the server to their settings for you, without touching anything else in the file. It can also go the other way and import servers you've already set up in an agent.
-
-Supported: Claude Code, OpenAI Codex, Cursor, VS Code, Zed, Windsurf, GitHub Copilot CLI, Google Antigravity, OpenCode, Amp, Devin, Kiro, Cline, Roo Code, Continue, Goose and Pi.
-
-**Use your servers from anywhere.** Share a server over the internet through Cloudflare, ngrok, Tailscale Funnel or OpenAI's tunnel, and copy the connection URL with one click. Handy for using your local tools from a web-based agent or another machine.
-
-![Remote access via Cloudflare](docs/screenshots/remote-access.png)
-
-**Stay out of the way.** Marshal can live in the system tray, start at login and keep servers running in the background. There's also a small command line for scripts:
+## Command line
 
 ```sh
-marshal list              # show servers and whether they're running
-marshal start <server>    # also: stop, restart
-marshal profile <name>    # start a group of servers
+marshal list              # Show the servers and their status
+marshal start <server>    # Start a server
+marshal stop <server>     # Stop a server
+marshal restart <server>  # Stop and start a server
+marshal profile <name>    # Start the servers in a profile
 ```
 
 ## Install
 
-Build and run from source:
+### From source
 
 ```sh
 cargo run --release
 ```
 
-Or build the Flatpak:
+### Flatpak
 
 ```sh
 flatpak-builder --user --install --force-clean builddir flatpak/io.github._6E6B.marshal.yml
 flatpak run io.github._6E6B.marshal
 ```
 
-To share servers remotely, install the tunnel tool you want to use (`cloudflared`, `ngrok`, `tailscale`…) on your system.
+### Remote access
+
+To share a server on the internet, install the applicable tunnel tool. Examples: `cloudflared`, `ngrok`, `tailscale`.
 
 ## License
 
-GPL-3.0-or-later. See [LICENSE](LICENSE).
+GPL-3.0-or-later. Refer to [LICENSE](LICENSE).
