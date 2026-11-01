@@ -2163,7 +2163,7 @@ impl Ui {
                         "tailscale"
                     };
                     ui.overlay.add_toast(adw::Toast::new(&format!(
-                        "Provider saved — {binary} must be installed on the host"
+                        "Provider saved - {binary} must be installed on the host"
                     )));
                 }
                 result => {
@@ -3427,7 +3427,7 @@ fn render_result(group: &ResultPane, value: &Value) {
                     text.push(t.to_owned());
                 } else {
                     text.push(format!(
-                        "{} content — available in Structured Result",
+                        "{} content - available in Structured Result",
                         item["type"].as_str().unwrap_or("Binary")
                     ));
                 }
