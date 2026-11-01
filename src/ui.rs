@@ -9,12 +9,78 @@ use gtk::{gio, glib};
 use serde_json::{Value, json};
 use std::{cell::RefCell, collections::HashMap, rc::Rc, sync::Arc, time::Instant};
 
+mod streams;
+
 struct CommandRow {
     id: String,
     row: adw::ActionRow,
     run: gtk::Button,
     edit: gtk::Button,
     delete: gtk::Button,
+}
+
+/// Read-only runtime facts shown under the server overview.
+struct Details {
+    group: adw::PreferencesGroup,
+    process: adw::ActionRow,
+    uptime: adw::ActionRow,
+    server: adw::ActionRow,
+    exit: adw::ActionRow,
+    bridge: adw::ActionRow,
+}
+
+impl Details {
+    fn new() -> Self {
+        let group = adw::PreferencesGroup::builder()
+            .title("Details")
+            .visible(false)
+            .build();
+        let row = |title: &str| {
+            let row = adw::ActionRow::builder()
+                .title(title)
+                .subtitle_selectable(true)
+                .use_markup(false)
+                .visible(false)
+                .build();
+            row.add_css_class("property");
+            group.add(&row);
+            row
+        };
+        let process = row("Process");
+        let uptime = row("Uptime");
+        let server = row("Server");
+        let exit = row("Exit Code");
+        let bridge = row("Local Bridge");
+        let copy = gtk::Button::builder()
+            .icon_name("edit-copy-symbolic")
+            .tooltip_text("Copy Bridge URL")
+            .valign(gtk::Align::Center)
+            .css_classes(["flat"])
+            .build();
+        let target = bridge.clone();
+        copy.connect_clicked(move |button| {
+            button
+                .clipboard()
+                .set_text(target.subtitle().as_deref().unwrap_or(""));
+        });
+        bridge.add_suffix(&copy);
+        Self {
+            group,
+            process,
+            uptime,
+            server,
+            exit,
+            bridge,
+        }
+    }
+    fn set(row: &adw::ActionRow, value: Option<String>) {
+        row.set_visible(value.is_some());
+        if let Some(value) = value
+            && row.subtitle().as_deref() != Some(value.as_str())
+        {
+            row.set_subtitle(&value);
+        }
+    }
 }
 
 thread_local! {
@@ -44,11 +110,16 @@ pub(crate) struct Ui {
     cpu_samples: RefCell<HashMap<String, (u64, Instant)>>,
     overview: adw::NavigationPage,
     status: adw::ActionRow,
+    status_dot: gtk::Image,
+    status_spinner: adw::Spinner,
     lifecycle: gtk::Button,
     banner: adw::Banner,
-    capabilities: Vec<adw::ActionRow>,
-    diagnostics: adw::ActionRow,
+    capabilities: Vec<(adw::ActionRow, gtk::Label)>,
+    details: Details,
+    logs_row: adw::ActionRow,
+    traffic_row: adw::ActionRow,
     commands: adw::PreferencesGroup,
+    add_command: adw::ButtonRow,
     command_rows: RefCell<Vec<CommandRow>>,
     command_signature: RefCell<String>,
     tray: RefCell<Option<crate::tray::TrayService>>,
@@ -57,6 +128,7 @@ pub(crate) struct Ui {
 }
 
 pub fn build(app: &adw::Application, manager: Arc<Manager>, present_window: bool) -> Rc<Ui> {
+    streams::ensure_css();
     let window = adw::ApplicationWindow::builder()
         .application(app)
         .title("Marshal")
@@ -116,19 +188,42 @@ pub fn build(app: &adw::Application, manager: Arc<Manager>, present_window: bool
             .tooltip_text("Main Menu")
             .build(),
     );
+    let search_toggle = gtk::ToggleButton::builder()
+        .icon_name("system-search-symbolic")
+        .tooltip_text("Search Servers (Ctrl+F)")
+        .build();
+    header.pack_end(&search_toggle);
     sidebar.add_top_bar(&header);
     let search = gtk::SearchEntry::builder()
-        .placeholder_text("Filter servers")
-        .margin_start(9)
-        .margin_end(9)
-        .margin_top(6)
-        .margin_bottom(6)
+        .placeholder_text("Search servers")
+        .hexpand(true)
         .build();
-    sidebar.add_top_bar(&search);
+    let search_bar = gtk::SearchBar::builder()
+        .child(
+            &adw::Clamp::builder()
+                .maximum_size(400)
+                .child(&search)
+                .build(),
+        )
+        .key_capture_widget(&sidebar)
+        .build();
+    search_bar.connect_entry(&search);
+    search_toggle
+        .bind_property("active", &search_bar, "search-mode-enabled")
+        .bidirectional()
+        .sync_create()
+        .build();
+    sidebar.add_top_bar(&search_bar);
     let list = gtk::ListBox::builder()
         .selection_mode(gtk::SelectionMode::Single)
         .build();
     list.add_css_class("navigation-sidebar");
+    let no_results = adw::StatusPage::builder()
+        .icon_name("system-search-symbolic")
+        .title("No Results")
+        .build();
+    no_results.add_css_class("compact");
+    list.set_placeholder(Some(&no_results));
     {
         let search = search.clone();
         list.set_filter_func(move |row| {
@@ -137,14 +232,9 @@ pub fn build(app: &adw::Application, manager: Arc<Manager>, present_window: bool
                 return true;
             }
             let text = text.to_lowercase();
-            row.child()
-                .and_downcast::<adw::ActionRow>()
-                .is_some_and(|r| {
-                    r.title().to_lowercase().contains(&text)
-                        || r.subtitle()
-                            .map(|s| s.to_lowercase().contains(&text))
-                            .unwrap_or(false)
-                })
+            named_descendant(row, "sidebar-title")
+                .and_downcast::<gtk::Label>()
+                .is_some_and(|label| label.text().to_lowercase().contains(&text))
         });
     }
     {
@@ -166,13 +256,16 @@ pub fn build(app: &adw::Application, manager: Arc<Manager>, present_window: bool
         .build();
     let list_stack = gtk::Stack::new();
     list_stack.add_named(&scroll, Some("servers"));
+    // The sidebar is narrow; a full status page with a 128px icon dwarfs it
+    // and duplicates the content pane's placeholder.
     let empty = adw::StatusPage::builder()
-        .icon_name("network-server-symbolic")
         .title("No Servers")
         .description("Add an MCP server to get started.")
+        .css_classes(["compact"])
         .build();
     let empty_add = gtk::Button::builder()
-        .label("Add Server")
+        .label("_Add Server")
+        .use_underline(true)
         .halign(gtk::Align::Center)
         .action_name("app.add-server")
         .css_classes(["suggested-action", "pill"])
@@ -208,59 +301,88 @@ pub fn build(app: &adw::Application, manager: Arc<Manager>, present_window: bool
     toolbar.add_top_bar(&detail_header);
     let banner = adw::Banner::builder()
         .button_label("Restart")
+        .button_style(adw::BannerButtonStyle::Suggested)
         .revealed(false)
         .build();
     toolbar.add_top_bar(&banner);
     let page = adw::PreferencesPage::new();
     let state_group = adw::PreferencesGroup::new();
     let status = adw::ActionRow::builder().title("Stopped").build();
+    let status_dot = gtk::Image::from_icon_name("media-record-symbolic");
+    status_dot.set_pixel_size(12);
+    status_dot.set_valign(gtk::Align::Center);
+    status_dot.set_margin_start(4);
+    status_dot.set_margin_end(4);
+    status.add_prefix(&status_dot);
+    let status_spinner = adw::Spinner::builder()
+        .width_request(20)
+        .height_request(20)
+        .valign(gtk::Align::Center)
+        .visible(false)
+        .build();
+    status.add_prefix(&status_spinner);
     let lifecycle = gtk::Button::builder()
         .label("Start")
         .valign(gtk::Align::Center)
+        // Match the row's 12px end padding above and below the button.
+        .margin_top(6)
+        .margin_bottom(6)
         .build();
     status.add_suffix(&lifecycle);
     state_group.add(&status);
     page.add(&state_group);
     let inspect = adw::PreferencesGroup::builder().title("Inspect").build();
-    let capabilities: Vec<_> = ["Tools", "Resources", "Prompts"]
-        .into_iter()
-        .map(|title| {
-            let row = link_row(title, "");
-            row.set_visible(false);
-            inspect.add(&row);
-            row
-        })
-        .collect();
-    let logs = link_row("Logs", "");
+    let capabilities: Vec<_> = [
+        ("Tools", "applications-engineering-symbolic"),
+        ("Resources", "folder-documents-symbolic"),
+        ("Prompts", "chat-message-new-symbolic"),
+    ]
+    .into_iter()
+    .map(|(title, icon)| {
+        let row = adw::ActionRow::builder()
+            .title(title)
+            .activatable(true)
+            .build();
+        row.add_prefix(&gtk::Image::from_icon_name(icon));
+        let count = gtk::Label::builder()
+            .valign(gtk::Align::Center)
+            .css_classes(["dim-label", "numeric"])
+            .build();
+        row.add_suffix(&count);
+        row.add_suffix(&gtk::Image::from_icon_name("go-next-symbolic"));
+        row.set_visible(false);
+        inspect.add(&row);
+        (row, count)
+    })
+    .collect();
+    let logs = icon_row("utilities-terminal-symbolic", "Logs", "");
     inspect.add(&logs);
-    let traffic = link_row("Traffic", "");
+    let traffic = icon_row("network-transmit-receive-symbolic", "Traffic", "");
     inspect.add(&traffic);
     page.add(&inspect);
     let manage = adw::PreferencesGroup::builder().title("Manage").build();
-    let manage_clients = link_row(
+    let manage_clients = icon_row(
+        "application-x-addon-symbolic",
         "Manage MCP Clients",
         "Install or remove this server in Claude Code, VS Code, Codex…",
     );
-    let remote = link_row("Remote Access", "");
-    let configuration = link_row("Configuration", "");
-    let diagnostics = adw::ActionRow::builder()
-        .title("Connection")
-        .subtitle_selectable(true)
-        .build();
+    let remote = icon_row("preferences-system-sharing-symbolic", "Remote Access", "");
+    let configuration = icon_row("emblem-system-symbolic", "Configuration", "");
     manage.add(&manage_clients);
     manage.add(&remote);
     manage.add(&configuration);
-    manage.add(&diagnostics);
     page.add(&manage);
+    let details = Details::new();
+    page.add(&details.group);
     let commands = adw::PreferencesGroup::builder()
         .title("Custom Commands")
+        .description("Buttons that run shell commands for this server")
         .build();
-    let add_command = gtk::Button::builder()
-        .icon_name("list-add-symbolic")
-        .tooltip_text("Add Command")
-        .valign(gtk::Align::Center)
+    let add_command = adw::ButtonRow::builder()
+        .title("Add Command")
+        .start_icon_name("list-add-symbolic")
         .build();
-    commands.set_header_suffix(Some(&add_command));
+    commands.add(&add_command);
     page.add(&commands);
     toolbar.set_content(Some(&page));
     let overview = adw::NavigationPage::new(&toolbar, "Server");
@@ -270,7 +392,8 @@ pub fn build(app: &adw::Application, manager: Arc<Manager>, present_window: bool
     placeholder_toolbar.set_content(Some(
         &adw::StatusPage::builder()
             .icon_name("network-server-symbolic")
-            .title("Select a Server")
+            .title("No Server Selected")
+            .css_classes(["compact"])
             .build(),
     ));
     let content_stack = gtk::Stack::new();
@@ -292,18 +415,26 @@ pub fn build(app: &adw::Application, manager: Arc<Manager>, present_window: bool
         cpu_samples: RefCell::new(HashMap::new()),
         overview,
         status,
+        status_dot,
+        status_spinner,
         lifecycle,
         banner,
         capabilities,
-        diagnostics,
+        details,
+        logs_row: logs.clone(),
+        traffic_row: traffic.clone(),
         commands,
+        add_command,
         command_rows: RefCell::new(vec![]),
         command_signature: RefCell::new(String::new()),
         tray: RefCell::new(None),
         tray_spawn_rx: RefCell::new(None),
     });
-    connect(&add_command, &ui, |ui| {
-        if let Some(id) = ui.id() {
+    let weak = Rc::downgrade(&ui);
+    ui.add_command.connect_activated(move |_| {
+        if let Some(ui) = weak.upgrade()
+            && let Some(id) = ui.id()
+        {
             ui.command_editor(id, None);
         }
     });
@@ -372,7 +503,7 @@ pub fn build(app: &adw::Application, manager: Arc<Manager>, present_window: bool
             ui.restart();
         }
     });
-    for (index, row) in ui.capabilities.iter().enumerate() {
+    for (index, (row, _)) in ui.capabilities.iter().enumerate() {
         let weak = Rc::downgrade(&ui);
         row.connect_activated(move |_| {
             if let Some(ui) = weak.upgrade() {
@@ -445,6 +576,13 @@ pub fn build(app: &adw::Application, manager: Arc<Manager>, present_window: bool
         });
         app.add_action(&action);
     }
+    let find = gio::SimpleAction::new("search", None);
+    {
+        let search_toggle = search_toggle.clone();
+        find.connect_activate(move |_, _| search_toggle.set_active(true));
+    }
+    ui.window.add_action(&find);
+    app.set_accels_for_action("win.search", &["<Control>f"]);
     app.set_accels_for_action("app.add-server", &["<Control>n"]);
     app.set_accels_for_action("app.preferences", &["<Control>comma"]);
     app.set_accels_for_action("app.quit", &["<Control>q"]);
@@ -561,6 +699,11 @@ fn link_row(title: &str, subtitle: &str) -> adw::ActionRow {
     row.add_suffix(&gtk::Image::from_icon_name("go-next-symbolic"));
     row
 }
+fn icon_row(icon: &str, title: &str, subtitle: &str) -> adw::ActionRow {
+    let row = link_row(title, subtitle);
+    row.add_prefix(&gtk::Image::from_icon_name(icon));
+    row
+}
 fn connect(button: &gtk::Button, ui: &Rc<Ui>, f: impl Fn(&Rc<Ui>) + 'static) {
     let weak = Rc::downgrade(ui);
     button.connect_clicked(move |_| {
@@ -591,12 +734,6 @@ fn string<'a>(v: &'a Value, key: &str) -> &'a str {
     v[key].as_str().unwrap_or("")
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum StreamKind {
-    Logs,
-    Traffic,
-}
-
 fn provider_index(provider: &str) -> u32 {
     match provider {
         "openai" => 1,
@@ -616,13 +753,6 @@ fn provider_id(index: u32) -> &'static str {
         5 => "cloudflare-named",
         _ => "",
     }
-}
-
-/// Log lines are rendered as "HH:MM:SS  source  message".
-fn split_log_line(line: &str) -> Option<(&str, &str, &str)> {
-    let (stamp, rest) = line.split_once("  ")?;
-    let (source, message) = rest.split_once("  ")?;
-    Some((stamp, source, message))
 }
 
 /// Reads resident memory and computes CPU utilization between samples.
@@ -664,6 +794,18 @@ fn process_stats(
     Some((rss, cpu))
 }
 
+fn format_duration(secs: u64) -> String {
+    let (d, h, m, s) = (secs / 86400, secs / 3600 % 24, secs / 60 % 60, secs % 60);
+    if d > 0 {
+        format!("{d}d {h}h {m}m")
+    } else if h > 0 {
+        format!("{h}h {m}m")
+    } else if m > 0 {
+        format!("{m}m {s}s")
+    } else {
+        format!("{s}s")
+    }
+}
 fn format_kib(kib: u64) -> String {
     if kib >= 1024 * 1024 {
         format!("{:.1} GiB", kib as f64 / 1024.0 / 1024.0)
@@ -1113,6 +1255,7 @@ impl Ui {
                     .icon_name("system-search-symbolic")
                     .title(format!("No {title}"))
                     .description("The server returned an empty list.")
+                    .css_classes(["compact"])
                     .build(),
             );
             return;
@@ -1344,7 +1487,15 @@ impl Ui {
     ) {
         button.set_sensitive(false);
         let original_label = button.label().unwrap_or_default();
-        button.set_label("Working…");
+        // Keep the pill's width steady while the label is swapped for a spinner.
+        button.set_size_request(button.width(), -1);
+        button.set_child(Some(
+            &adw::Spinner::builder()
+                .width_request(16)
+                .height_request(16)
+                .build(),
+        ));
+        button.update_property(&[gtk::accessible::Property::Label("Working…")]);
         let manager = self.manager.clone();
         let id = id.to_owned();
         let method = method.to_owned();
@@ -1359,6 +1510,7 @@ impl Ui {
             let response = task.await;
             button.set_sensitive(true);
             button.set_label(&original_label);
+            button.set_size_request(-1, -1);
             match response {
                 Ok(Ok(value)) => {
                     result.group.set_visible(true);
@@ -1367,175 +1519,6 @@ impl Ui {
                 Ok(Err(e)) => ui.error(&format!("{e:#}")),
                 Err(e) => ui.error(&e.to_string()),
             }
-        });
-    }
-    fn logs(&self) {
-        self.stream_page("Logs", StreamKind::Logs);
-    }
-    fn traffic(&self) {
-        self.stream_page("Traffic", StreamKind::Traffic);
-    }
-    fn stream_page(&self, title: &str, kind: StreamKind) {
-        let Some(id) = self.id() else {
-            return;
-        };
-        let view = text_view("", false);
-        view.set_vexpand(true);
-        let scroll = gtk::ScrolledWindow::builder()
-            .child(&view)
-            .vexpand(true)
-            .build();
-        let toolbar = self.push(title, &scroll);
-        let bar = gtk::ActionBar::new();
-        let search = gtk::SearchEntry::builder()
-            .placeholder_text("Filter")
-            .hexpand(true)
-            .build();
-        bar.pack_start(&search);
-        let sources = gtk::DropDown::from_strings(&["All Sources"]);
-        sources.set_tooltip_text(Some("Source"));
-        let source_list = Rc::new(RefCell::new(vec!["All Sources".to_string()]));
-        if kind == StreamKind::Logs {
-            bar.pack_start(&sources);
-        }
-        let copy = gtk::Button::builder()
-            .icon_name("edit-copy-symbolic")
-            .tooltip_text("Copy")
-            .build();
-        let save = gtk::Button::builder()
-            .icon_name("document-save-symbolic")
-            .tooltip_text("Save to File…")
-            .build();
-        bar.pack_end(&save);
-        bar.pack_end(&copy);
-        toolbar.add_bottom_bar(&bar);
-
-        let filtered = Rc::new(RefCell::new(String::new()));
-        {
-            let filtered = filtered.clone();
-            copy.connect_clicked(move |button| {
-                button.clipboard().set_text(&filtered.borrow());
-            });
-        }
-        {
-            let filtered = filtered.clone();
-            let overlay = self.overlay.clone();
-            let default_name = format!("marshal-{}.log", title.to_lowercase());
-            let title = title.to_owned();
-            let window = self.window.clone();
-            save.connect_clicked(move |_| {
-                let picker = gtk::FileDialog::builder()
-                    .title(format!("Save {title}"))
-                    .modal(true)
-                    .initial_name(&default_name)
-                    .build();
-                let filtered = filtered.clone();
-                let overlay = overlay.clone();
-                picker.save(
-                    Some(&window),
-                    None::<&gio::Cancellable>,
-                    move |result| match result {
-                        Ok(file) => {
-                            let text = filtered.borrow().clone();
-                            match file.path() {
-                                Some(path) => match std::fs::write(&path, text) {
-                                    Ok(()) => overlay.add_toast(adw::Toast::new(&format!(
-                                        "Saved to {}",
-                                        path.display()
-                                    ))),
-                                    Err(e) => overlay.add_toast(adw::Toast::new(&format!(
-                                        "Could not save: {e}"
-                                    ))),
-                                },
-                                None => overlay.add_toast(adw::Toast::new("Choose a local file")),
-                            }
-                        }
-                        Err(error)
-                            if error.matches(gtk::DialogError::Dismissed)
-                                || error.matches(gtk::DialogError::Cancelled) => {}
-                        Err(error) => {
-                            overlay.add_toast(adw::Toast::new(&format!("Could not save: {error}")))
-                        }
-                    },
-                );
-            });
-        }
-        let rerender = Rc::new(std::cell::Cell::new(false));
-        {
-            let rerender = rerender.clone();
-            search.connect_search_changed(move |_| rerender.set(true));
-        }
-        {
-            let rerender = rerender.clone();
-            sources.connect_selected_notify(move |_| rerender.set(true));
-        }
-        let manager = self.manager.clone();
-        let weak = view.downgrade();
-        let scroll_weak = scroll.downgrade();
-        let mut previous = String::new();
-        glib::timeout_add_local(std::time::Duration::from_millis(350), move || {
-            let Some(view) = weak.upgrade() else {
-                return glib::ControlFlow::Break;
-            };
-            let Some(scroll) = scroll_weak.upgrade() else {
-                return glib::ControlFlow::Break;
-            };
-            let snapshot = manager.snapshot(&id);
-            let lines = match kind {
-                StreamKind::Logs => snapshot.logs,
-                StreamKind::Traffic => snapshot.traffic,
-            };
-            if kind == StreamKind::Logs {
-                let mut found: Vec<String> = vec!["All Sources".into()];
-                let mut seen: std::collections::HashSet<String> =
-                    ["All Sources".to_string()].into_iter().collect();
-                for line in &lines {
-                    if let Some((_, source, _)) = split_log_line(line)
-                        && seen.insert(source.to_string())
-                    {
-                        found.push(source.to_string());
-                    }
-                }
-                if *source_list.borrow() != found {
-                    *source_list.borrow_mut() = found.clone();
-                    sources.set_model(Some(&gtk::StringList::new(
-                        &found.iter().map(String::as_str).collect::<Vec<_>>(),
-                    )));
-                    sources.set_selected(0);
-                }
-            }
-            let needle = search.text().to_lowercase();
-            let selected_source = source_list
-                .borrow()
-                .get(sources.selected() as usize)
-                .cloned()
-                .unwrap_or_default();
-            let text = lines
-                .iter()
-                .filter(|line| {
-                    (kind != StreamKind::Logs
-                        || selected_source == "All Sources"
-                        || split_log_line(line).is_some_and(|(_, s, _)| s == selected_source))
-                        && (needle.is_empty() || line.to_lowercase().contains(&needle))
-                })
-                .cloned()
-                .collect::<Vec<_>>()
-                .join("\n");
-            if text != previous || rerender.replace(false) {
-                let adjustment = scroll.vadjustment();
-                let at_bottom =
-                    adjustment.value() >= adjustment.upper() - adjustment.page_size() - 12.0;
-                view.buffer().set_text(&text);
-                *filtered.borrow_mut() = text.clone();
-                if at_bottom {
-                    let buffer = view.buffer();
-                    let mark = buffer.create_mark(None, &buffer.end_iter(), false);
-                    view.scroll_mark_onscreen(&mark);
-                    buffer.delete_mark(&mark);
-                }
-                previous = text;
-            }
-            glib::ControlFlow::Continue
         });
     }
     /// Shows a server-initiated request for user input.
@@ -1630,6 +1613,15 @@ impl Ui {
             .title("Remote Access")
             .subtitle("Off")
             .build();
+        let remote_spinner = adw::Spinner::builder()
+            .width_request(20)
+            .height_request(20)
+            .valign(gtk::Align::Center)
+            .visible(false)
+            .build();
+        state.add_prefix(&remote_spinner);
+        let remote_icon = gtk::Image::from_icon_name("preferences-system-sharing-symbolic");
+        state.add_prefix(&remote_icon);
         let toggle = gtk::Button::builder()
             .label("Enable Remote Access")
             .valign(gtk::Align::Center)
@@ -1637,15 +1629,17 @@ impl Ui {
         state.add_suffix(&toggle);
         state_group.add(&state);
         let endpoint = adw::ActionRow::builder()
-            .title("Connection")
+            .title("Public Endpoint")
             .subtitle_selectable(true)
             .visible(false)
             .build();
         endpoint.set_use_markup(false);
+        endpoint.add_css_class("property");
         let copy = gtk::Button::builder()
             .icon_name("edit-copy-symbolic")
             .tooltip_text("Copy Connection")
             .valign(gtk::Align::Center)
+            .css_classes(["flat"])
             .build();
         endpoint.add_suffix(&copy);
         state_group.add(&endpoint);
@@ -1821,6 +1815,22 @@ impl Ui {
             } else {
                 "Enable Remote Access"
             });
+            let connected = s.remote_state == "Connected";
+            let pending = active && !connected;
+            remote_spinner.set_visible(pending || busy.get());
+            remote_icon.set_visible(!(pending || busy.get()));
+            if connected {
+                remote_icon.add_css_class("success");
+            } else {
+                remote_icon.remove_css_class("success");
+            }
+            if active {
+                toggle.remove_css_class("suggested-action");
+                toggle.add_css_class("destructive-action");
+            } else {
+                toggle.remove_css_class("destructive-action");
+                toggle.add_css_class("suggested-action");
+            }
             let configured = m.server(&id).is_ok_and(|server| {
                 group.set_description(match server.remote.provider.as_str() {
                     "cloudflare" => Some("Quick Tunnels are temporary and do not support SSE. Anyone with the endpoint can use this server's tools. Use a named tunnel with Cloudflare Access for persistent remote access."),
@@ -2228,15 +2238,27 @@ impl Ui {
             });
         for server in servers {
             let snap = self.manager.snapshot(&server.id);
-            let row = adw::ActionRow::builder()
-                .title(&server.name)
-                .subtitle(&snap.state)
+            let title = gtk::Label::builder()
+                .label(&server.name)
+                .xalign(0.0)
+                .hexpand(true)
+                .ellipsize(gtk::pango::EllipsizeMode::End)
                 .build();
-            row.set_use_markup(false);
+            title.set_widget_name("sidebar-title");
+            // .navigation-sidebar rows already have 8px horizontal padding;
+            // top it up so all four sides are an even 10px.
+            let content = gtk::Box::builder()
+                .orientation(gtk::Orientation::Horizontal)
+                .spacing(12)
+                .margin_top(10)
+                .margin_bottom(10)
+                .margin_start(2)
+                .margin_end(2)
+                .build();
+            content.append(&title);
+            content.append(&sidebar_status_dot(&snap));
+            let row = gtk::ListBoxRow::builder().child(&content).build();
             row.set_widget_name(&server.id);
-            row.set_selectable(true);
-            row.set_activatable(true);
-            row.add_suffix(&sidebar_status_dot(&snap));
             self.list.append(&row);
             if selected.as_deref() == Some(&server.id) {
                 self.list.select_row(Some(&row));
@@ -2331,9 +2353,8 @@ impl Ui {
         let mut row = self.list.first_child();
         while let Some(widget) = row {
             row = widget.next_sibling();
-            if let Ok(r) = widget.downcast::<adw::ActionRow>() {
+            if let Ok(r) = widget.downcast::<gtk::ListBoxRow>() {
                 let snap = self.manager.snapshot(r.widget_name().as_str());
-                r.set_subtitle(&snap.state);
                 if let Some(dot) = named_descendant(&r, "status-dot")
                     .and_then(|widget| widget.downcast::<gtk::Image>().ok())
                 {
@@ -2360,22 +2381,26 @@ impl Ui {
             for command in self.command_rows.borrow_mut().drain(..) {
                 self.commands.remove(&command.row);
             }
+            // Keep the add button after the commands.
+            self.commands.remove(&self.add_command);
             for command in &server.commands {
                 let row = adw::ActionRow::builder().title(&command.name).build();
                 row.set_use_markup(false);
                 let run = gtk::Button::builder()
-                    .label(&command.name)
+                    .label("Run")
                     .valign(gtk::Align::Center)
                     .build();
                 let edit = gtk::Button::builder()
                     .icon_name("document-edit-symbolic")
                     .tooltip_text("Edit Command")
                     .valign(gtk::Align::Center)
+                    .css_classes(["flat"])
                     .build();
                 let delete = gtk::Button::builder()
                     .icon_name("user-trash-symbolic")
                     .tooltip_text("Remove Command")
                     .valign(gtk::Align::Center)
+                    .css_classes(["flat"])
                     .build();
                 let server_id = id.clone();
                 let command_id = command.id.clone();
@@ -2412,9 +2437,10 @@ impl Ui {
                         m.save(server, vec![]).await
                     });
                 });
-                row.add_suffix(&run);
+                row.add_prefix(&gtk::Image::from_icon_name("utilities-terminal-symbolic"));
                 row.add_suffix(&edit);
                 row.add_suffix(&delete);
+                row.add_suffix(&run);
                 self.commands.add(&row);
                 self.command_rows.borrow_mut().push(CommandRow {
                     id: command.id.clone(),
@@ -2424,6 +2450,7 @@ impl Ui {
                     delete,
                 });
             }
+            self.commands.add(&self.add_command);
             *self.command_signature.borrow_mut() = signature;
         }
         for CommandRow {
@@ -2437,13 +2464,12 @@ impl Ui {
             let state = s.commands.get(cid).map(String::as_str).unwrap_or("Ready");
             let running = state == "Running";
             row.set_subtitle(state);
-            let name = server
-                .commands
-                .iter()
-                .find(|c| &c.id == cid)
-                .map(|c| c.name.as_str())
-                .unwrap_or("Run");
-            run.set_label(if running { "Stop" } else { name });
+            run.set_label(if running { "Stop" } else { "Run" });
+            if running {
+                run.add_css_class("destructive-action");
+            } else {
+                run.remove_css_class("destructive-action");
+            }
             edit.set_sensitive(!running);
             delete.set_sensitive(!running);
         }
@@ -2454,6 +2480,15 @@ impl Ui {
             Connection::Http { url, .. } => url,
         });
         self.status.set_use_markup(false);
+        let transitioning = matches!(s.state.as_str(), "Starting" | "Restarting" | "Stopping");
+        self.status_spinner.set_visible(transitioning);
+        self.status_dot.set_visible(!transitioning);
+        apply_sidebar_status(&self.status_dot, &s);
+        if s.active() {
+            self.lifecycle.remove_css_class("suggested-action");
+        } else {
+            self.lifecycle.add_css_class("suggested-action");
+        }
         self.lifecycle
             .set_label(if matches!(server.connection, Connection::Http { .. }) {
                 if s.active() { "Disconnect" } else { "Connect" }
@@ -2474,7 +2509,7 @@ impl Ui {
         } else {
             None
         });
-        for (i, row) in self.capabilities.iter().enumerate() {
+        for (i, (row, count_label)) in self.capabilities.iter().enumerate() {
             let (key, count) = match i {
                 0 => ("tools", s.tools.len()),
                 1 => ("resources", s.resources.len() + s.templates.len()),
@@ -2485,39 +2520,71 @@ impl Ui {
                     .as_ref()
                     .is_some_and(|v| v["capabilities"].get(key).is_some()),
             );
-            row.set_subtitle(&format!("{count} available"));
+            count_label.set_label(&count.to_string());
             row.set_sensitive(s.state == "Running");
         }
-        let mut diagnostics = vec![];
-        if let Some(pid) = s.pid {
-            diagnostics.push(format!("PID {pid}"));
-            if let Some((rss, cpu)) = process_stats(&mut self.cpu_samples.borrow_mut(), &id, pid) {
-                diagnostics.push(format!("Memory {} · CPU {cpu:.1}%", format_kib(rss)));
-            }
-        } else {
+        let (errors, last_error) = s
+            .logs
+            .iter()
+            .filter(|e| e.level == crate::backend::LogLevel::Error)
+            .fold((0, None), |(n, _), e| (n + 1, Some(e.time.clone())));
+        self.logs_row.set_subtitle(&match (errors, last_error) {
+            (0, _) if s.logs.is_empty() => String::new(),
+            (0, _) => "No errors".into(),
+            (n, Some(at)) => format!(
+                "{n} error{} · latest at {at}",
+                if n == 1 { "" } else { "s" }
+            ),
+            (n, None) => format!("{n} errors"),
+        });
+        let requests = s
+            .traffic
+            .iter()
+            .filter(|e| e.outcome != crate::backend::TrafficOutcome::Notification)
+            .count();
+        let failed = s.traffic.iter().filter(|e| e.failed()).count();
+        self.traffic_row.set_subtitle(&match (requests, failed) {
+            (0, _) => String::new(),
+            (n, 0) => format!("{n} request{}", if n == 1 { "" } else { "s" }),
+            (n, f) => format!("{n} request{} · {f} failed", if n == 1 { "" } else { "s" }),
+        });
+        let process =
+            s.pid.map(
+                |pid| match process_stats(&mut self.cpu_samples.borrow_mut(), &id, pid) {
+                    Some((rss, cpu)) => {
+                        format!("PID {pid} · {} · CPU {cpu:.1}%", format_kib(rss))
+                    }
+                    None => format!("PID {pid}"),
+                },
+            );
+        if s.pid.is_none() {
             self.cpu_samples.borrow_mut().remove(&id);
         }
-        if let Some(since) = s.since {
-            let elapsed = since.elapsed().as_secs();
-            diagnostics.push(format!("Up {}m {}s", elapsed / 60, elapsed % 60));
-        }
-        if let Some(code) = s.exit_code {
-            diagnostics.push(format!("Exit code {code}"));
-        }
-        if let Some(info) = &s.info {
-            diagnostics.push(format!(
+        let uptime = s
+            .since
+            .map(|since| format_duration(since.elapsed().as_secs()));
+        let exit = s.exit_code.map(|code| code.to_string());
+        let info = s.info.as_ref().map(|info| {
+            format!(
                 "{} {} · MCP {}",
                 string(&info["serverInfo"], "name"),
                 string(&info["serverInfo"], "version"),
                 string(info, "protocolVersion")
-            ));
-        }
-        if let Some(bridge) = &s.local_endpoint {
-            diagnostics.push(format!("Bridge: {bridge}"));
-        }
-        self.diagnostics.set_visible(!diagnostics.is_empty());
-        self.diagnostics.set_use_markup(false);
-        self.diagnostics.set_subtitle(&diagnostics.join("\n"));
+            )
+        });
+        let details = &self.details;
+        details.group.set_visible(
+            process.is_some()
+                || uptime.is_some()
+                || exit.is_some()
+                || info.is_some()
+                || s.local_endpoint.is_some(),
+        );
+        Details::set(&details.process, process);
+        Details::set(&details.uptime, uptime);
+        Details::set(&details.exit, exit);
+        Details::set(&details.server, info);
+        Details::set(&details.bridge, s.local_endpoint.clone());
 
         if let Some(mut rx) = self.tray_spawn_rx.borrow_mut().take() {
             match rx.try_recv() {
@@ -3437,18 +3504,25 @@ fn render_result(group: &ResultPane, value: &Value) {
     if text.is_empty() {
         text.push("The request completed without text content.".into());
     }
+    let is_error = value["isError"].as_bool() == Some(true);
+    let container = gtk::Box::new(gtk::Orientation::Vertical, 12);
     let output = text_view(&text.join("\n\n"), false);
     output.set_monospace(false);
-    group.add(
-        &gtk::ScrolledWindow::builder()
-            .min_content_height(100)
-            .max_content_height(320)
-            .propagate_natural_height(true)
-            .child(&output)
-            .build(),
-    );
+    let card = gtk::ScrolledWindow::builder()
+        .min_content_height(100)
+        .max_content_height(320)
+        .propagate_natural_height(true)
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .overflow(gtk::Overflow::Hidden)
+        .css_classes(["card"])
+        .child(&output)
+        .build();
+    if is_error {
+        card.add_css_class("error");
+    }
+    container.append(&card);
     let raw = adw::ExpanderRow::builder()
-        .title(if value["isError"].as_bool() == Some(true) {
+        .title(if is_error {
             "Tool Reported an Error · Structured Result"
         } else {
             "Structured Result"
@@ -3462,10 +3536,18 @@ fn render_result(group: &ResultPane, value: &Value) {
         &gtk::ScrolledWindow::builder()
             .min_content_height(160)
             .max_content_height(320)
+            .propagate_natural_height(true)
+            .hscrollbar_policy(gtk::PolicyType::Never)
             .child(&view)
             .build(),
     );
-    group.add(&raw);
+    let list = gtk::ListBox::builder()
+        .selection_mode(gtk::SelectionMode::None)
+        .css_classes(["boxed-list"])
+        .build();
+    list.append(&raw);
+    container.append(&list);
+    group.add(&container);
 }
 
 fn environment_editor(
@@ -4193,6 +4275,141 @@ mod tests {
         adw::StyleManager::default().set_color_scheme(adw::ColorScheme::ForceLight);
         settle();
         snapshot(&ui, "server-light");
+        for (source, level, message) in [
+            ("stderr", None, "INFO Server listening on stdio"),
+            (
+                "stderr",
+                None,
+                "WARNING cache directory missing, using /tmp",
+            ),
+            (
+                "stderr",
+                None,
+                "WARNING cache directory missing, using /tmp",
+            ),
+            (
+                "stderr",
+                None,
+                "WARNING cache directory missing, using /tmp",
+            ),
+            (
+                "search",
+                Some(crate::backend::LogLevel::Error),
+                "Index lookup failed: connection refused (os error 111)",
+            ),
+            (
+                "stdout",
+                None,
+                "A long line that should wrap across the available width so that it can be read without scrolling sideways, which the old view required",
+            ),
+        ] {
+            ui.manager.log_at("ui-fixture", source, level, message);
+        }
+        ui.navigation.pop_to_page(&ui.overview);
+        ui.logs();
+        settle();
+        settle();
+        snapshot(&ui, "logs-light");
+        for (client, method, params, result, ms) in [
+            (
+                "Claude Code 2.1.0",
+                "tools/call",
+                json!({"name": "search_docs", "arguments": {"query": "tunnels"}}),
+                Ok(json!({"content": [{"type": "text", "text": "3 results"}]})),
+                84,
+            ),
+            (
+                "Claude Code 2.1.0",
+                "tools/call",
+                json!({"name": "search_docs", "arguments": {"query": ""}}),
+                Ok(
+                    json!({"isError": true, "content": [{"type": "text", "text": "query must not be empty"}]}),
+                ),
+                12,
+            ),
+            (
+                "Visual Studio Code 1.105",
+                "resources/read",
+                json!({"uri": "file:///README.md"}),
+                Ok(json!({"contents": []})),
+                1840,
+            ),
+            (
+                "Visual Studio Code 1.105",
+                "tools/call",
+                json!({"name": "fetch_page", "arguments": {"url": "https://example.com"}}),
+                Err("Upstream timed out".to_string()),
+                60000,
+            ),
+        ] {
+            ui.manager.record_traffic(
+                "ui-fixture",
+                client,
+                method,
+                &params,
+                Some(result.as_ref().map_err(Clone::clone)),
+                Some(std::time::Duration::from_millis(ms)),
+            );
+        }
+        ui.manager.record_traffic(
+            "ui-fixture",
+            "Claude Code 2.1.0",
+            "notifications/initialized",
+            &json!({}),
+            None,
+            None,
+        );
+        ui.navigation.pop_to_page(&ui.overview);
+        ui.traffic();
+        settle();
+        settle();
+        snapshot(&ui, "traffic-light");
+        let toggle = descendants(&ui.navigation.visible_page().unwrap())
+            .into_iter()
+            .find_map(|w| {
+                w.downcast::<adw::ToggleGroup>()
+                    .ok()
+                    .filter(|g| g.toggle_by_name("summary").is_some())
+            })
+            .unwrap();
+        toggle.set_active_name(Some("summary"));
+        settle();
+        snapshot(&ui, "traffic-summary-light");
+        let entry = ui
+            .manager
+            .snapshot("ui-fixture")
+            .traffic
+            .iter()
+            .rev()
+            .nth(2)
+            .unwrap()
+            .clone();
+        ui.traffic_detail(&entry);
+        settle();
+        snapshot(&ui, "traffic-detail-light");
+        adw::StyleManager::default().set_color_scheme(adw::ColorScheme::ForceDark);
+        ui.navigation.pop_to_page(&ui.overview);
+        ui.logs();
+        settle();
+        settle();
+        snapshot(&ui, "logs-dark");
+        ui.navigation.pop_to_page(&ui.overview);
+        ui.traffic();
+        settle();
+        settle();
+        snapshot(&ui, "traffic-dark");
+        ui.window.set_default_size(390, 700);
+        settle();
+        snapshot(&ui, "traffic-narrow");
+        ui.navigation.pop_to_page(&ui.overview);
+        ui.logs();
+        settle();
+        settle();
+        snapshot(&ui, "logs-narrow");
+        ui.window.set_default_size(1040, 740);
+        adw::StyleManager::default().set_color_scheme(adw::ColorScheme::ForceLight);
+        settle();
+        ui.navigation.pop_to_page(&ui.overview);
         let tool = ui.manager.snapshot("ui-fixture").tools[0].clone();
         ui.tool("ui-fixture", &tool);
         settle();
