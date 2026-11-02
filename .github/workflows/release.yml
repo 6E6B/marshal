@@ -1,0 +1,138 @@
+name: Release
+run-name: Release ${{ github.ref_name }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: Publish immediately (otherwise create a draft to review)
+        type: boolean
+        default: false
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    name: Validate release
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
+      sha: ${{ steps.version.outputs.sha }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: Check versions and existing release
+        id: version
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          args=()
+          if [[ "$GITHUB_REF_TYPE" == tag ]]; then
+            args=(--tag "$GITHUB_REF_NAME")
+          fi
+          version=$(python3 scripts/release.py "${args[@]}")
+          tag="v$version"
+          sha=$(git rev-parse HEAD)
+          if git show-ref --verify --quiet "refs/tags/$tag"; then
+            test "$(git rev-parse "$tag^{commit}")" = "$sha" || {
+              echo "::error::Tag $tag already points to a different commit"
+              exit 1
+            }
+          fi
+          # Listing also surfaces authentication/API failures instead of treating them as absence.
+          gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" > releases.json
+          TAG="$tag" SHA="$sha" python3 - <<'PY'
+          import json, os
+          from json import JSONDecoder
+          text = open("releases.json").read().strip()
+          while text:
+              page, end = JSONDecoder().raw_decode(text)
+              for release in page:
+                  if release["tag_name"] == os.environ["TAG"]:
+                      if not release["draft"]:
+                          raise SystemExit("Published release already exists; use a new version")
+                      if release["target_commitish"] != os.environ["SHA"]:
+                          raise SystemExit("Existing draft targets another commit; review/delete that draft first")
+              text = text[end:].lstrip()
+          PY
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build and test
+    needs: prepare
+    uses: ./.github/workflows/ci.yml
+
+  release:
+    name: Upload release assets
+    needs: [prepare, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      VERSION: ${{ needs.prepare.outputs.version }}
+      TAG: ${{ needs.prepare.outputs.tag }}
+      RELEASE_SHA: ${{ needs.prepare.outputs.sha }}
+      PUBLISH: ${{ github.event_name == 'workflow_dispatch' && inputs.publish }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.prepare.outputs.sha }}
+          fetch-depth: 0
+      - uses: actions/download-artifact@v4
+        with:
+          name: marshal-flatpak-x86_64
+          path: dist
+      - name: Package release and checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          mv dist/marshal.flatpak "dist/marshal-$VERSION-linux-x86_64.flatpak"
+          git archive --format=tar.gz --prefix="marshal-$VERSION/" \
+            -o "dist/marshal-$VERSION-source.tar.gz" "$RELEASE_SHA"
+          cd dist
+          sha256sum *.flatpak *.tar.gz > SHA256SUMS
+          sha256sum --check SHA256SUMS
+      - name: Create or resume draft, upload assets, optionally publish
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Recheck here in case a release was published while CI was running.
+          gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
+            --jq ".[] | select(.tag_name == \"$TAG\")" > existing.json
+          if [[ -s existing.json ]]; then
+            python3 - <<'PY'
+          import json, os
+          release = json.load(open("existing.json"))
+          if not release["draft"] or release["target_commitish"] != os.environ["RELEASE_SHA"]:
+              raise SystemExit("Refusing to replace an existing published release or a draft for another commit")
+          PY
+          else
+            flags=()
+            if [[ "$VERSION" == *-* ]]; then flags+=(--prerelease); fi
+            gh release create "$TAG" --target "$RELEASE_SHA" --draft \
+              --title "Marshal $VERSION" --generate-notes "${flags[@]}"
+          fi
+          gh release upload "$TAG" dist/* --clobber
+          if [[ "$PUBLISH" == true ]]; then
+            gh release edit "$TAG" --draft=false
+          fi
+          url=$(gh release view "$TAG" --json url --jq .url)
+          echo "### [Marshal $VERSION]($url)" >> "$GITHUB_STEP_SUMMARY"
+          echo 'Built Linux x86_64 Flatpak, source archive, and SHA256SUMS.' >> "$GITHUB_STEP_SUMMARY"
+          if [[ "$PUBLISH" != true ]]; then
+            echo 'Draft ready: review the notes and click **Publish release**.' >> "$GITHUB_STEP_SUMMARY"
+          fi
