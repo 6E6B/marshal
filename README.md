@@ -58,6 +58,14 @@ marshal profile <name>    # Start the servers in a profile
 
 ## Install
 
+Download the Linux x86_64 `.flatpak` from [Releases](https://github.com/6E6B/marshal/releases/latest), then install it:
+
+```sh
+flatpak remote-add --user --if-not-exists flathub https://flathub.org/repo/flathub.flatpakrepo
+flatpak install --user ./marshal-*-linux-x86_64.flatpak
+flatpak run io.github._6E6B.marshal
+```
+
 Build and run from source:
 
 ```sh
@@ -72,6 +80,10 @@ flatpak run io.github._6E6B.marshal
 ```
 
 For remote access, install the tunnel tool you want to use (`cloudflared`, `ngrok`, `tailscale`, etc.).
+
+## Releases
+
+Maintainers can build and publish from **Actions → Release → Run workflow**. See [the release guide](docs/releases.md) for version updates, draft review, and tag-based releases.
 
 ## License
 
