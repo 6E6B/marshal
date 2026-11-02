@@ -1,6 +1,6 @@
 [package]
 name = "marshal"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "A native GNOME manager for MCP servers"
 license = "GPL-3.0-or-later"

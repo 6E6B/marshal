@@ -49,6 +49,11 @@
   </supports>
   <content_rating type="oars-1.1"/>
   <releases>
+    <release version="0.1.1" date="2026-11-01">
+      <description>
+        <p>Add automated Flatpak release builds, source archives, and checksums.</p>
+      </description>
+    </release>
     <release version="0.1.0" date="2026-09-08">
       <description>
         <p>Initial public packaging.</p>

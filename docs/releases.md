@@ -6,7 +6,7 @@ After the release workflow is merged into `main`:
 
 1. Open **Actions → Release → Run workflow** on GitHub.
 2. Select `main`. Leave **Publish immediately** unchecked to review a draft, or check it to publish when the build finishes.
-3. Click **Run workflow**. The current version is `0.1.0`, so this creates `v0.1.0`.
+3. Click **Run workflow**. The current version is `0.1.1`, so this creates `v0.1.1`. The existing `v0.1.0` tag is preserved.
 4. Open the release linked in the workflow summary. For a draft, review the generated notes and click **Publish release**.
 
 The workflow uses the built-in `GITHUB_TOKEN`. No PAT, signing key, or repository secret is required.
